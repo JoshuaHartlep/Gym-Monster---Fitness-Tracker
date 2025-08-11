@@ -114,9 +114,9 @@ def _clean_inplace(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
     df = df.dropna(subset=["Date", "Weight"]).reset_index(drop=True)
     stats["dropped_nulls"] = orig_len - len(df)
 
-    # Deduplicate by Date keeping the last occurrence
+    # Aggregate multiple logs per calendar date by mean (calendar-day canonicalization)
     before = len(df)
-    df = df.drop_duplicates(subset=["Date"], keep="last")
+    df = df.groupby("Date", as_index=False)["Weight"].mean()
     stats["deduped"] = before - len(df)
 
     # Sort ascending
@@ -642,7 +642,7 @@ def _confidence_badges(df: pd.DataFrame, weekly_notes: List[str], trend_28_count
 # Visualization helpers
 # -------------------------------
 
-def make_daily_chart(df: pd.DataFrame, show_roll7: bool = True, show_roll14: bool = False) -> go.Figure:
+def make_daily_chart(df: pd.DataFrame, show_roll7: bool = True) -> go.Figure:
     fig = go.Figure()
     if df.empty:
         fig.update_layout(title="Daily Weight", template="plotly_white")
@@ -655,9 +655,6 @@ def make_daily_chart(df: pd.DataFrame, show_roll7: bool = True, show_roll14: boo
     if show_roll7:
         roll7 = compute_rolling(df, 7)
         fig.add_trace(go.Scatter(x=x, y=roll7, mode="lines", name="7-day avg"))
-    if show_roll14:
-        roll14 = compute_rolling(df, 14)
-        fig.add_trace(go.Scatter(x=x, y=roll14, mode="lines", name="14-day avg"))
 
     fig.update_layout(
         title="Daily Weight & Rolling Averages",
@@ -665,6 +662,7 @@ def make_daily_chart(df: pd.DataFrame, show_roll7: bool = True, show_roll14: boo
         yaxis_title="Weight (lb)",
         hovermode="x unified",
         template="plotly_white",
+        uirevision="daily_rolling_uirev",
     )
     return fig
 
@@ -690,18 +688,39 @@ def make_weekly_change_chart(weekly_changes_df: pd.DataFrame) -> go.Figure:
 
 def get_roll7_series(df: pd.DataFrame) -> Dict[str, object]:
     """
-    Return the 7-day rolling average series used by visuals with metadata.
-    - Primary: centered rolling mean with trailing fallback via compute_rolling(df, 7)
-    - Alt fallback: centered rolling mean with min_periods=4 and trailing fallback
+    Calendar 7-day WEIGHTED average (no gaps):
+    - Daily canonicalization: average multiple logs per day; reindex to continuous daily dates
+    - For each day t, consider days d=0..6 (t-d). Raw weights w_raw[d] = 7-d. Mask missing days.
+    - If at least one day exists in window, compute normalized weighted mean; else NaN.
+    Returns {"series": roll7w (pd.Series indexed by date), "meta": {...}}
     """
     if df.empty:
-        return {"series": pd.Series(dtype=float), "alt_series": pd.Series(dtype=float), "meta": {"centered_with_trailing_fallback": True}}
-    # Primary: reuse compute_rolling behavior
-    primary = compute_rolling(df, 7)
-    # Alt: min_periods=4 centered + trailing fallback
-    alt_centered = df["Weight"].rolling(window=7, center=True, min_periods=4).mean()
-    alt = alt_centered.combine_first(df["Weight"].rolling(window=7, center=False, min_periods=1).mean())
-    return {"series": primary, "alt_series": alt, "meta": {"centered_with_trailing_fallback": True}}
+        return {"series": pd.Series(dtype=float), "meta": {"calendar_window": 7, "weights": [7,6,5,4,3,2,1]}}
+    daily = df.copy().dropna(subset=["Date", "Weight"]).groupby("Date", as_index=False)["Weight"].mean().sort_values("Date")
+    idx = pd.date_range(daily["Date"].min(), daily["Date"].max(), freq="D")
+    s = pd.Series(daily["Weight"].values, index=pd.to_datetime(daily["Date"]))
+    s = s.reindex(idx)
+    n = len(s)
+    # Precompute raw weights for offsets 0..6
+    w_raw = np.array([7, 6, 5, 4, 3, 2, 1], dtype=float)
+    out = np.full(n, np.nan, dtype=float)
+    for i in range(n):
+        # window indices j from i-6..i
+        j_start = max(0, i - 6)
+        j_end = i
+        window_vals = s.iloc[j_start:j_end+1].to_numpy(dtype=float)
+        # corresponding offsets d where d = i - j
+        d_vals = np.arange(j_end - j_start, -1, -1)  # from (i-j_start) down to 0
+        # Map to weights: for each position j, offset d = i-j in [0..6]
+        w_j = np.array([w_raw[int(i - (j_start + k))] for k in range(len(window_vals))], dtype=float)
+        mask = ~np.isnan(window_vals)
+        w_eff = w_j * mask.astype(float)
+        w_sum = w_eff.sum()
+        if w_sum > 0:
+            out[i] = float(np.nansum((window_vals * w_eff) / w_sum))
+        # else remain NaN
+    roll7w = pd.Series(out, index=idx.date)
+    return {"series": roll7w, "meta": {"calendar_window": 7, "weights": [7,6,5,4,3,2,1]}}
 
 
 def _compute_date_range(df: pd.DataFrame, mode: str, custom_start: Optional[date], custom_end: Optional[date]) -> Tuple[Optional[date], Optional[date], Optional[str]]:
@@ -795,52 +814,67 @@ def compute_avg_rate(df: pd.DataFrame, lookback_days: Optional[int] = None, star
 
     # Get roll-7 series computed on full dataset
     roll = get_roll7_series(df2)
-    r_primary: pd.Series = roll["series"]
-    r_alt: pd.Series = roll["alt_series"]
-    # Align with df2 index
-    # Find first and last in-range indices with non-null roll7
-    mask = (df2["Date"] >= start_date) & (df2["Date"] <= end_date)
-    idx_in_range = df2.index[mask]
-    # Start endpoint
-    start_idx = next((i for i in idx_in_range if pd.notna(r_primary.iloc[i])), None)
-    end_idx = next((i for i in reversed(idx_in_range.tolist()) if pd.notna(r_primary.iloc[i])), None)
+    r_primary: pd.Series = roll["series"]  # indexed by date
+    # Create alternative roll-7 with min_periods=4 for fallback
+    daily = df2.copy().dropna(subset=["Date", "Weight"]).groupby("Date", as_index=False)["Weight"].mean().sort_values("Date")
+    idx = pd.date_range(daily["Date"].min(), daily["Date"].max(), freq="D")
+    s = pd.Series(daily["Weight"].values, index=pd.to_datetime(daily["Date"]))
+    s = s.reindex(idx)
+    r_alt = s.rolling(window=7, min_periods=4).mean()
+    r_alt.index = r_alt.index.date
+    # Build inclusive date list for window
+    dates_window = pd.date_range(start_date, end_date, freq="D").date
+    # Find first and last date in range with defined roll-7
+    start_date_ep = next((d for d in dates_window if d in r_primary.index and pd.notna(r_primary.loc[d])), None)
+    end_date_ep = next((d for d in reversed(dates_window.tolist()) if d in r_primary.index and pd.notna(r_primary.loc[d])), None)
     start_type = "roll7"
     end_type = "roll7"
     used_fallback_raw = False
     roll7_start = None
     roll7_end = None
     # Fallback to alt if needed
-    if start_idx is None or end_idx is None:
-        if start_idx is None:
-            start_idx = next((i for i in idx_in_range if pd.notna(r_alt.iloc[i])), None)
-            if start_idx is not None:
+    if start_date_ep is None or end_date_ep is None:
+        if start_date_ep is None:
+            start_date_ep = next((d for d in dates_window if d in r_alt.index and pd.notna(r_alt.loc[d])), None)
+            if start_date_ep is not None:
                 start_type = "roll7_alt"
-        if end_idx is None:
-            end_idx = next((i for i in reversed(idx_in_range.tolist()) if pd.notna(r_alt.iloc[i])), None)
-            if end_idx is not None:
+        if end_date_ep is None:
+            end_date_ep = next((d for d in reversed(dates_window.tolist()) if d in r_alt.index and pd.notna(r_alt.loc[d])), None)
+            if end_date_ep is not None:
                 end_type = "roll7_alt"
     # If still missing, fall back to raw at endpoints
-    if start_idx is None:
-        start_idx = int(idx_in_range.min())
+    if start_date_ep is None:
+        start_date_ep = dates_window[0]
         start_type = "raw"
         used_fallback_raw = True
-        roll7_start = float(df2.iloc[start_idx]["Weight"]) if start_idx is not None else None
+        roll7_start = float(df2.loc[df2["Date"] == start_date_ep, "Weight"].iloc[0]) if (df2["Date"] == start_date_ep).any() else None
     else:
-        roll7_start = float(r_primary.iloc[start_idx]) if start_type == "roll7" else float(r_alt.iloc[start_idx])
-    if end_idx is None:
-        end_idx = int(idx_in_range.max())
+        roll7_start = float(r_primary.loc[start_date_ep]) if start_type == "roll7" else float(r_alt.loc[start_date_ep])
+    if end_date_ep is None:
+        end_date_ep = dates_window[-1]
         end_type = "raw"
         used_fallback_raw = True or used_fallback_raw
-        roll7_end = float(df2.iloc[end_idx]["Weight"]) if end_idx is not None else None
+        roll7_end = float(df2.loc[df2["Date"] == end_date_ep, "Weight"].iloc[0]) if (df2["Date"] == end_date_ep).any() else None
     else:
-        roll7_end = float(r_primary.iloc[end_idx]) if end_type == "roll7" else float(r_alt.iloc[end_idx])
+        roll7_end = float(r_primary.loc[end_date_ep]) if end_type == "roll7" else float(r_alt.loc[end_date_ep])
 
-    endpoint_start_date = df2.iloc[start_idx]["Date"] if start_idx is not None else None
-    endpoint_end_date = df2.iloc[end_idx]["Date"] if end_idx is not None else None
+    endpoint_start_date = start_date_ep
+    endpoint_end_date = end_date_ep
     if endpoint_start_date is None or endpoint_end_date is None:
         return {"status": "insufficient_data", "debug_lines": debug_lines}
     days_elapsed = (endpoint_end_date - endpoint_start_date).days
     debug_lines.append(f"w_start:{roll7_start} w_end:{roll7_end} days:{days_elapsed}")
+    if used_fallback_raw:
+        # count n_days present in the last 7 calendar days for visibility
+        # build the 7-day window at endpoint where fallback happened
+        if start_type == "raw":
+            win = pd.date_range(endpoint_start_date - timedelta(days=6), endpoint_start_date, freq="D").date
+            n_days = int(sum(1 for d in win if d in r_primary.index and pd.notna(r_primary.get(d, np.nan))))
+            debug_lines.append(f"7D endpoint fallback at {endpoint_start_date}: used raw daily due to insufficient days (n={n_days}).")
+        if end_type == "raw":
+            win = pd.date_range(endpoint_end_date - timedelta(days=6), endpoint_end_date, freq="D").date
+            n_days = int(sum(1 for d in win if d in r_primary.index and pd.notna(r_primary.get(d, np.nan))))
+            debug_lines.append(f"7D endpoint fallback at {endpoint_end_date}: used raw daily due to insufficient days (n={n_days}).")
     if days_elapsed < 1:
         return {"status": "insufficient_data", "debug_lines": debug_lines}
     avg_day = (roll7_end - roll7_start) / days_elapsed
@@ -1048,6 +1082,24 @@ def main():
     st.set_page_config(page_title="Gym Monster", layout="wide")
     st.title("Gym Monster")
     st.caption("Your weight trends, explained.")
+    
+    # Initialize date range state once at top (single source of truth)
+    if "committed_mode" not in st.session_state:
+        st.session_state.committed_mode = "6M"
+        st.session_state.committed_start = None
+        st.session_state.committed_end = None
+        st.session_state.ui_mode = "6M"
+        st.session_state.ui_start = None
+        st.session_state.ui_end = None
+        
+    # Weekly range state
+    if "committed_weekly_mode" not in st.session_state:
+        st.session_state.committed_weekly_mode = "6M"
+        st.session_state.committed_weekly_start = None
+        st.session_state.committed_weekly_end = None
+        st.session_state.ui_weekly_mode = "6M"
+        st.session_state.ui_weekly_start = None
+        st.session_state.ui_weekly_end = None
 
     # Sidebar/left controls vs insights on right
     left, right = st.columns([1, 1])
@@ -1165,8 +1217,6 @@ def main():
         st.subheader("Gym Monster • Insights")
         df = st.session_state.df
 
-        # Rolling averages toggles
-        show_roll14 = st.toggle("Show 14‑day rolling average", value=False)
 
         # Weekly metrics
         weekly = compute_weekly_metrics(df, week_start=week_start)
@@ -1338,36 +1388,59 @@ def main():
     # Charts
     chart_col1, chart_col2 = st.columns(2)
     with chart_col1:
-        # Range controls block
-        if "range_mode" not in st.session_state:
-            st.session_state.range_mode = "All"
-        if "custom_start" not in st.session_state:
-            st.session_state.custom_start = None
-        if "custom_end" not in st.session_state:
-            st.session_state.custom_end = None
-
         st.markdown("#### Range")
         modes = ["1W", "1M", "3M", "6M", "1Y", "YTD", "All", "Custom"]
-        st.session_state.range_mode = st.radio(
-            "Date range", options=modes, index=modes.index(st.session_state.range_mode), horizontal=True, key="range_mode_radio"
+        
+        # Render preset selector using UI state
+        ui_mode = st.radio(
+            "Date range", 
+            options=modes, 
+            index=modes.index(st.session_state.ui_mode), 
+            horizontal=True, 
+            key="range_mode_radio"
         )
+        
+        # Commit policy: presets commit immediately
+        if ui_mode != st.session_state.ui_mode:
+            st.session_state.ui_mode = ui_mode
+            if ui_mode != "Custom":
+                # Preset selected - commit immediately
+                st.session_state.committed_mode = ui_mode
+                st.session_state.committed_start = None
+                st.session_state.committed_end = None
 
-        if st.session_state.range_mode == "Custom":
+        # Custom date controls
+        if st.session_state.ui_mode == "Custom":
             cstart, cend = st.columns(2)
             with cstart:
-                st.session_state.custom_start = st.date_input("Start", value=st.session_state.custom_start)
+                st.session_state.ui_start = st.date_input("Start", value=st.session_state.ui_start, key="custom_start_input")
             with cend:
-                st.session_state.custom_end = st.date_input("End", value=st.session_state.custom_end)
+                st.session_state.ui_end = st.date_input("End", value=st.session_state.ui_end, key="custom_end_input")
+            
+            # Apply button for custom range
+            if st.button("Apply Custom Range", key="apply_custom_range"):
+                if st.session_state.ui_start is not None and st.session_state.ui_end is not None:
+                    if st.session_state.ui_start <= st.session_state.ui_end:
+                        # Valid custom range - commit it
+                        st.session_state.committed_mode = "Custom"
+                        st.session_state.committed_start = st.session_state.ui_start
+                        st.session_state.committed_end = st.session_state.ui_end
+                        st.success("Custom range applied!")
+                    else:
+                        st.error("Start date must be on or before end date")
+                else:
+                    st.error("Please select both start and end dates")
 
-        # Compute range
-        start_d, end_d, err = _compute_date_range(st.session_state.df, st.session_state.range_mode, st.session_state.custom_start, st.session_state.custom_end)
+        # Compute range using only committed values
+        start_d, end_d, err = _compute_date_range(st.session_state.df, st.session_state.committed_mode, st.session_state.committed_start, st.session_state.committed_end)
         if err:
             st.error(err)
         else:
             # Prepare series: compute rolling on full data then filter
             df_full = st.session_state.df
-            roll7_full = compute_rolling(df_full, 7)
-            roll14_full = compute_rolling(df_full, 14) if show_roll14 else None
+            # Calendar 7-day series
+            roll7_obj = get_roll7_series(df_full)
+            roll7_full = roll7_obj["series"]
 
             mask = (df_full["Date"] >= start_d) & (df_full["Date"] <= end_d)
             df_vis = df_full.loc[mask].reset_index(drop=True)
@@ -1378,9 +1451,7 @@ def main():
                 # Visible arrays for autoscale
                 y_arrays = [df_vis["Weight"].to_numpy(dtype=float)]
                 if roll7_full is not None:
-                    y_arrays.append(roll7_full.loc[mask].to_numpy(dtype=float))
-                if roll14_full is not None:
-                    y_arrays.append(roll14_full.loc[mask].to_numpy(dtype=float))
+                    y_arrays.append(pd.Series(roll7_full).loc[start_d:end_d].to_numpy(dtype=float))
                 # Y-axis mode: Auto | Manual
                 st.session_state.setdefault("daily_y_mode", "Auto")
                 st.session_state.setdefault("daily_y_min", 100.0)
@@ -1399,18 +1470,73 @@ def main():
                 else:
                     y0, y1 = _autoscale_y(y_arrays)
 
-                # Build figure using filtered data, but plot rolling from filtered slices
+
+                # Build figure
                 fig = go.Figure()
                 x = df_vis["Date"]
                 y = df_vis["Weight"]
-                fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers", name="Daily", hovertemplate="%{x|%Y-%m-%d}: %{y:.1f} lb"))
-                # Rolling 7
-                roll7_vis = roll7_full.loc[mask]
-                fig.add_trace(go.Scatter(x=x, y=roll7_vis.values, mode="lines", name="7-day avg"))
-                # Rolling 14
-                if show_roll14 and roll14_full is not None:
-                    roll14_vis = roll14_full.loc[mask]
-                    fig.add_trace(go.Scatter(x=x, y=roll14_vis.values, mode="lines", name="14-day avg"))
+                
+                # Daily trace (always first, stable identity)
+                fig.add_trace(go.Scatter(
+                    x=x, 
+                    y=y, 
+                    mode="lines+markers", 
+                    name="Daily", 
+                    uid="trace-daily",
+                    legendgroup="daily",
+                    hovertemplate="%{x|%Y-%m-%d}: %{y:.1f} lb"
+                ))
+
+                # Rolling 7 (always second, stable identity)
+                roll7_vis = pd.Series(roll7_full).loc[start_d:end_d]
+                x7 = list(roll7_vis.index)
+                fig.add_trace(go.Scatter(
+                    x=x7, 
+                    y=roll7_vis.values, 
+                    mode="lines", 
+                    name="7-day avg", 
+                    uid="trace-roll7",
+                    legendgroup="roll7",
+                    line=dict(width=3),
+                    connectgaps=False
+                ))
+                
+                # Set initial visibility (both visible by default)
+                fig.data[0].visible = True  # Daily
+                fig.data[1].visible = True  # 7-day avg
+                # 7D gap connectors
+                v7 = roll7_vis.values
+                t7 = np.array(x7)
+                if len(v7) > 0:
+                    nan_mask = np.isnan(v7)
+                    if nan_mask.any():
+                        # find contiguous NaN runs and bounded neighbors
+                        in_gap = False
+                        start_nan = None
+                        for k in range(len(v7)):
+                            if nan_mask[k] and not in_gap:
+                                in_gap = True
+                                start_nan = k
+                            if (not nan_mask[k] or k == len(v7)-1) and in_gap:
+                                end_nan = k-1 if not nan_mask[k] else k
+                                # bounded if start_nan>0 and end_nan < len(v7)-1
+                                if start_nan > 0 and end_nan < len(v7)-1:
+                                    i_end = start_nan - 1
+                                    i_start = end_nan + 1
+                                    fig.add_trace(go.Scatter(
+                                        x=[t7[i_end], t7[i_start]],
+                                        y=[v7[i_end], v7[i_start]],
+                                        mode="lines",
+                                        line=dict(dash="dot", width=3, color="red"),
+                                        opacity=0.7,
+                                        name="7-day connectors",
+                                        uid="trace-roll7-connectors",
+                                        legendgroup="roll7",
+                                        showlegend=False,
+                                        hoverinfo="skip",
+                                    ))
+                                in_gap = False
+                                start_nan = None
 
                 fig.update_layout(
                     title="Daily Weight & Rolling Averages",
@@ -1419,32 +1545,59 @@ def main():
                     hovermode="x unified",
                     template="plotly_white",
                     yaxis=dict(range=[y0, y1]),
+                    uirevision="daily_rolling_uirev",
+                    legend=dict(groupclick="togglegroup"),
                 )
 
                 # Inline range summary with reset hint (Plotly has a reset in modebar)
                 st.caption(f"Showing: {start_d:%b %d, %Y} – {end_d:%b %d, %Y}")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, key="daily_rolling_chart", use_container_width=True)
     with chart_col2:
-        # Weekly chart controls
         st.markdown("#### Weekly Range")
-        if "weekly_range_mode" not in st.session_state:
-            st.session_state.weekly_range_mode = "All"
-        if "weekly_custom_start" not in st.session_state:
-            st.session_state.weekly_custom_start = None
-        if "weekly_custom_end" not in st.session_state:
-            st.session_state.weekly_custom_end = None
         modes_w = ["1W", "1M", "3M", "6M", "1Y", "YTD", "All", "Custom"]
-        st.session_state.weekly_range_mode = st.radio(
-            "Weekly date range", options=modes_w, index=modes_w.index(st.session_state.weekly_range_mode), horizontal=True, key="weekly_range_mode_radio"
+        
+        # Render weekly preset selector using UI state
+        ui_weekly_mode = st.radio(
+            "Weekly date range", 
+            options=modes_w, 
+            index=modes_w.index(st.session_state.ui_weekly_mode), 
+            horizontal=True, 
+            key="weekly_range_mode_radio"
         )
-        if st.session_state.weekly_range_mode == "Custom":
+        
+        # Commit policy: presets commit immediately
+        if ui_weekly_mode != st.session_state.ui_weekly_mode:
+            st.session_state.ui_weekly_mode = ui_weekly_mode
+            if ui_weekly_mode != "Custom":
+                # Preset selected - commit immediately
+                st.session_state.committed_weekly_mode = ui_weekly_mode
+                st.session_state.committed_weekly_start = None
+                st.session_state.committed_weekly_end = None
+
+        # Custom date controls
+        if st.session_state.ui_weekly_mode == "Custom":
             csa, cea = st.columns(2)
             with csa:
-                st.session_state.weekly_custom_start = st.date_input("Start (weekly)", value=st.session_state.weekly_custom_start)
+                st.session_state.ui_weekly_start = st.date_input("Start (weekly)", value=st.session_state.ui_weekly_start, key="weekly_custom_start_input")
             with cea:
-                st.session_state.weekly_custom_end = st.date_input("End (weekly)", value=st.session_state.weekly_custom_end)
+                st.session_state.ui_weekly_end = st.date_input("End (weekly)", value=st.session_state.ui_weekly_end, key="weekly_custom_end_input")
+            
+            # Apply button for custom weekly range
+            if st.button("Apply Custom Weekly Range", key="apply_custom_weekly_range"):
+                if st.session_state.ui_weekly_start is not None and st.session_state.ui_weekly_end is not None:
+                    if st.session_state.ui_weekly_start <= st.session_state.ui_weekly_end:
+                        # Valid custom range - commit it
+                        st.session_state.committed_weekly_mode = "Custom"
+                        st.session_state.committed_weekly_start = st.session_state.ui_weekly_start
+                        st.session_state.committed_weekly_end = st.session_state.ui_weekly_end
+                        st.success("Custom weekly range applied!")
+                    else:
+                        st.error("Start date must be on or before end date")
+                else:
+                    st.error("Please select both start and end dates")
 
-        w_start_d, w_end_d, w_err = _compute_date_range(st.session_state.df, st.session_state.weekly_range_mode, st.session_state.weekly_custom_start, st.session_state.weekly_custom_end)
+        # Compute range using only committed values
+        w_start_d, w_end_d, w_err = _compute_date_range(st.session_state.df, st.session_state.committed_weekly_mode, st.session_state.committed_weekly_start, st.session_state.committed_weekly_end)
         if w_err:
             st.error(w_err)
         else:
