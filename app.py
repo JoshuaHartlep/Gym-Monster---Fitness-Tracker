@@ -1083,23 +1083,118 @@ def main():
     st.title("Gym Monster")
     st.caption("Your weight trends, explained.")
     
-    # Initialize date range state once at top (single source of truth)
+    # State tracer for debugging (commented out - functionality confirmed)
+    # st.session_state.setdefault("_run_id", 0)
+    # st.session_state.setdefault("_last_commit", None)
+    # st.session_state["_run_id"] += 1
+    
+    def _log(msg):
+        pass  # Debug logging disabled
+        # st.write(f"DBG r{st.session_state['_run_id']}: {msg}")
+    
+    # Transactional commit buffer (One Writer Rule)
+    st.session_state.setdefault("_pending_commits", {})
+    
+    def commit_pending():
+        pc = st.session_state["_pending_commits"]
+        if pc:
+            st.session_state.update(pc)   # atomic-ish
+            st.session_state["_pending_commits"] = {}
+            # _log(f"Applied pending commits: {list(pc.keys())}")
+    
+    # Initialize committed + UI state once
     if "committed_mode" not in st.session_state:
-        st.session_state.committed_mode = "6M"
-        st.session_state.committed_start = None
-        st.session_state.committed_end = None
-        st.session_state.ui_mode = "6M"
-        st.session_state.ui_start = None
-        st.session_state.ui_end = None
+        st.session_state.update({
+            "committed_mode": "6M",
+            "committed_start": None,
+            "committed_end": None,
+            "ui_mode": "6M",
+            "ui_start": None,
+            "ui_end": None,
+            "committed_weekly_mode": "6M",
+            "committed_weekly_start": None,
+            "committed_weekly_end": None,
+            "ui_weekly_mode": "6M",
+            "ui_weekly_start": None,
+            "ui_weekly_end": None,
+        })
+        # _log("Initialized fresh state")
+    
+    # Helper to derive range from mode
+    def derive_range_from_mode(df, mode):
+        if df.empty:
+            return None, None
+        min_d = df["Date"].min()
+        max_d = df["Date"].max()
         
-    # Weekly range state
-    if "committed_weekly_mode" not in st.session_state:
-        st.session_state.committed_weekly_mode = "6M"
-        st.session_state.committed_weekly_start = None
-        st.session_state.committed_weekly_end = None
-        st.session_state.ui_weekly_mode = "6M"
-        st.session_state.ui_weekly_start = None
-        st.session_state.ui_weekly_end = None
+        if mode == "All":
+            return min_d, max_d
+        if mode == "YTD":
+            start = date(max_d.year, 1, 1)
+            return start, max_d
+        
+        days_map = {"1W": 7, "1M": 30, "3M": 90, "6M": 180, "1Y": 365}
+        if mode in days_map:
+            start = max_d - timedelta(days=days_map[mode] - 1)
+            return max(min_d, start), max_d
+        
+        return None, None  # Custom mode
+    
+    # Callback functions (write only to _pending_commits)
+    def on_preset_change():
+        mode = st.session_state["ui_mode"]
+        if mode != "Custom":
+            # Load df to derive start/end
+            df = st.session_state.get("df", pd.DataFrame())
+            start, end = derive_range_from_mode(df, mode)
+            st.session_state["_pending_commits"] = {
+                "committed_mode": mode,
+                "committed_start": start,
+                "committed_end": end,
+            }
+            # _log(f"Preset change: {mode}")
+    
+    def on_apply_custom():
+        start = st.session_state.get("ui_start")
+        end = st.session_state.get("ui_end")
+        if not start or not end or start > end:
+            st.session_state["_pending_commits"] = {}  # no-op
+            st.session_state["_last_commit"] = "invalid_custom"
+            # _log("Invalid custom range")
+            return
+        st.session_state["_pending_commits"] = {
+            "committed_mode": "Custom",
+            "committed_start": start,
+            "committed_end": end,
+        }
+        # _log(f"Custom range applied: {start} -> {end}")
+    
+    def on_weekly_preset_change():
+        mode = st.session_state["ui_weekly_mode"]
+        if mode != "Custom":
+            df = st.session_state.get("df", pd.DataFrame())
+            start, end = derive_range_from_mode(df, mode)
+            st.session_state["_pending_commits"] = {
+                "committed_weekly_mode": mode,
+                "committed_weekly_start": start,
+                "committed_weekly_end": end,
+            }
+            # _log(f"Weekly preset change: {mode}")
+    
+    def on_apply_weekly_custom():
+        start = st.session_state.get("ui_weekly_start")
+        end = st.session_state.get("ui_weekly_end")
+        if not start or not end or start > end:
+            st.session_state["_pending_commits"] = {}
+            st.session_state["_last_commit"] = "invalid_weekly_custom"
+            # _log("Invalid weekly custom range")
+            return
+        st.session_state["_pending_commits"] = {
+            "committed_weekly_mode": "Custom",
+            "committed_weekly_start": start,
+            "committed_weekly_end": end,
+        }
+        # _log(f"Weekly custom range applied: {start} -> {end}")
 
     # Sidebar/left controls vs insights on right
     left, right = st.columns([1, 1])
@@ -1391,47 +1486,37 @@ def main():
         st.markdown("#### Range")
         modes = ["1W", "1M", "3M", "6M", "1Y", "YTD", "All", "Custom"]
         
-        # Render preset selector using UI state
-        ui_mode = st.radio(
-            "Date range", 
-            options=modes, 
-            index=modes.index(st.session_state.ui_mode), 
-            horizontal=True, 
-            key="range_mode_radio"
+        # Render preset selector (UI state only, callback handles commits)
+        st.radio(
+            "Date range",
+            options=modes,
+            key="ui_mode",
+            on_change=on_preset_change,
+            horizontal=True,
         )
         
-        # Commit policy: presets commit immediately
-        if ui_mode != st.session_state.ui_mode:
-            st.session_state.ui_mode = ui_mode
-            if ui_mode != "Custom":
-                # Preset selected - commit immediately
-                st.session_state.committed_mode = ui_mode
-                st.session_state.committed_start = None
-                st.session_state.committed_end = None
-
         # Custom date controls
         if st.session_state.ui_mode == "Custom":
             cstart, cend = st.columns(2)
             with cstart:
-                st.session_state.ui_start = st.date_input("Start", value=st.session_state.ui_start, key="custom_start_input")
+                st.date_input("Start", key="ui_start")
             with cend:
-                st.session_state.ui_end = st.date_input("End", value=st.session_state.ui_end, key="custom_end_input")
+                st.date_input("End", key="ui_end")
             
             # Apply button for custom range
-            if st.button("Apply Custom Range", key="apply_custom_range"):
-                if st.session_state.ui_start is not None and st.session_state.ui_end is not None:
-                    if st.session_state.ui_start <= st.session_state.ui_end:
-                        # Valid custom range - commit it
-                        st.session_state.committed_mode = "Custom"
-                        st.session_state.committed_start = st.session_state.ui_start
-                        st.session_state.committed_end = st.session_state.ui_end
-                        st.success("Custom range applied!")
-                    else:
-                        st.error("Start date must be on or before end date")
-                else:
-                    st.error("Please select both start and end dates")
+            st.button("Apply Custom Range", on_click=on_apply_custom, key="apply_custom_btn")
+            
+            # Show validation errors
+            if st.session_state.get("_last_commit") == "invalid_custom":
+                st.error("Please select valid dates where start ≤ end")
 
-        # Compute range using only committed values
+        # Commit pending changes before computing data (ONE WRITER RULE)
+        commit_pending()
+        
+        # _log(f"committed={st.session_state['committed_mode']} "
+        #      f"{st.session_state.get('committed_start')}→{st.session_state.get('committed_end')}")
+
+        # Compute range using only committed values (pure function)
         start_d, end_d, err = _compute_date_range(st.session_state.df, st.session_state.committed_mode, st.session_state.committed_start, st.session_state.committed_end)
         if err:
             st.error(err)
@@ -1556,47 +1641,34 @@ def main():
         st.markdown("#### Weekly Range")
         modes_w = ["1W", "1M", "3M", "6M", "1Y", "YTD", "All", "Custom"]
         
-        # Render weekly preset selector using UI state
-        ui_weekly_mode = st.radio(
-            "Weekly date range", 
-            options=modes_w, 
-            index=modes_w.index(st.session_state.ui_weekly_mode), 
-            horizontal=True, 
-            key="weekly_range_mode_radio"
+        # Render weekly preset selector (UI state only, callback handles commits)
+        st.radio(
+            "Weekly date range",
+            options=modes_w,
+            key="ui_weekly_mode",
+            on_change=on_weekly_preset_change,
+            horizontal=True,
         )
-        
-        # Commit policy: presets commit immediately
-        if ui_weekly_mode != st.session_state.ui_weekly_mode:
-            st.session_state.ui_weekly_mode = ui_weekly_mode
-            if ui_weekly_mode != "Custom":
-                # Preset selected - commit immediately
-                st.session_state.committed_weekly_mode = ui_weekly_mode
-                st.session_state.committed_weekly_start = None
-                st.session_state.committed_weekly_end = None
 
         # Custom date controls
         if st.session_state.ui_weekly_mode == "Custom":
             csa, cea = st.columns(2)
             with csa:
-                st.session_state.ui_weekly_start = st.date_input("Start (weekly)", value=st.session_state.ui_weekly_start, key="weekly_custom_start_input")
+                st.date_input("Start (weekly)", key="ui_weekly_start")
             with cea:
-                st.session_state.ui_weekly_end = st.date_input("End (weekly)", value=st.session_state.ui_weekly_end, key="weekly_custom_end_input")
+                st.date_input("End (weekly)", key="ui_weekly_end")
             
             # Apply button for custom weekly range
-            if st.button("Apply Custom Weekly Range", key="apply_custom_weekly_range"):
-                if st.session_state.ui_weekly_start is not None and st.session_state.ui_weekly_end is not None:
-                    if st.session_state.ui_weekly_start <= st.session_state.ui_weekly_end:
-                        # Valid custom range - commit it
-                        st.session_state.committed_weekly_mode = "Custom"
-                        st.session_state.committed_weekly_start = st.session_state.ui_weekly_start
-                        st.session_state.committed_weekly_end = st.session_state.ui_weekly_end
-                        st.success("Custom weekly range applied!")
-                    else:
-                        st.error("Start date must be on or before end date")
-                else:
-                    st.error("Please select both start and end dates")
+            st.button("Apply Custom Weekly Range", on_click=on_apply_weekly_custom, key="apply_weekly_custom_btn")
+            
+            # Show validation errors
+            if st.session_state.get("_last_commit") == "invalid_weekly_custom":
+                st.error("Please select valid dates where start ≤ end")
 
-        # Compute range using only committed values
+        # Commit weekly pending changes before computing data
+        commit_pending()
+
+        # Compute range using only committed values (pure function)
         w_start_d, w_end_d, w_err = _compute_date_range(st.session_state.df, st.session_state.committed_weekly_mode, st.session_state.committed_weekly_start, st.session_state.committed_weekly_end)
         if w_err:
             st.error(w_err)
