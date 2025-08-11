@@ -1,0 +1,1513 @@
+#!/usr/bin/env python3
+"""
+Run instructions
+- Create a virtualenv (optional) and install dependencies:
+    pip install streamlit pandas numpy plotly scipy python-dateutil pytz
+- Run the app:
+    streamlit run app.py
+
+Notes
+- This is a single-file Streamlit MVP for local use. Data is persisted to a JSON file in the project directory by default.
+- A small synthetic dataset is embedded for quick demo on first run if no persistence exists and no CSV is provided.
+- To use your own CSV, use the file uploader in the left panel or place a file at ./weights.csv.
+
+CSV assumptions
+- Columns: Date,Weight
+- Date formats: ISO or common US; parsing is robust.
+- Units: lbs; Timezone assumed local calendar days (America/Chicago semantics, but dates are treated naive).
+
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from io import StringIO
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import pytz
+from dateutil import parser as dateparser
+import html
+import hashlib
+
+# SciPy is optional for robust Theil–Sen. Fall back to simple OLS if unavailable.
+try:
+    from scipy.stats import theilslopes
+
+    SCIPY_AVAILABLE = True
+except Exception:  # pragma: no cover
+    SCIPY_AVAILABLE = False
+
+import streamlit as st
+import streamlit.components.v1 as components
+
+
+# -------------------------------
+# Configuration and constants
+# -------------------------------
+PERSIST_PATH = os.path.join(os.path.dirname(__file__), "weights.json")
+DEFAULT_CSV_PATH = os.path.join(os.path.dirname(__file__), "weights.csv")
+LOCAL_TZ = pytz.timezone("America/Chicago")
+
+SAMPLE_CSV = """Date,Weight
+2025-01-01,200.0
+2025-01-03,199.2
+2025-01-05,198.8
+2025-01-08,198.6
+2025-01-10,197.9
+2025-01-12,197.2
+2025-01-15,196.8
+2025-01-18,196.0
+2025-01-21,195.5
+2025-01-25,195.1
+"""
+
+
+# -------------------------------
+# Utility and core functions
+# -------------------------------
+
+def _ensure_date(obj) -> date:
+    if isinstance(obj, pd.Timestamp):
+        return obj.date()
+    if isinstance(obj, datetime):
+        return obj.date()
+    if isinstance(obj, date):
+        return obj
+    # robust parse
+    dt = dateparser.parse(str(obj)).date()
+    return dt
+
+
+def _clean_inplace(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """
+    Clean and normalize the dataset.
+    - Parse Date as datetime64[ns], then keep only date part
+    - Coerce Weight to float
+    - Drop nulls
+    - Deduplicate by Date keeping the last occurrence
+    - Sort ascending by Date
+
+    Returns: (clean_df, stats)
+    stats = {"dropped_nulls": int, "deduped": int}
+    """
+    stats = {"dropped_nulls": 0, "deduped": 0}
+
+    if "Date" not in df.columns or "Weight" not in df.columns:
+        raise ValueError("CSV must contain 'Date' and 'Weight' columns")
+
+    # Coerce types
+    # Keep original length for stats
+    orig_len = len(df)
+
+    # Parse and coerce
+    df = df.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    df["Weight"] = pd.to_numeric(df["Weight"], errors="coerce").astype(float)
+
+    # Drop rows with nulls after coercion
+    df = df.dropna(subset=["Date", "Weight"]).reset_index(drop=True)
+    stats["dropped_nulls"] = orig_len - len(df)
+
+    # Deduplicate by Date keeping the last occurrence
+    before = len(df)
+    df = df.drop_duplicates(subset=["Date"], keep="last")
+    stats["deduped"] = before - len(df)
+
+    # Sort ascending
+    df = df.sort_values("Date").reset_index(drop=True)
+
+    return df, stats
+
+
+def clean_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean dataset. See _clean_inplace for details.
+    """
+    cleaned, _ = _clean_inplace(df)
+    return cleaned
+
+
+def save_data(df: pd.DataFrame, path: str = PERSIST_PATH) -> None:
+    # Persist to a simple JSON list for portability
+    data = [{"Date": d.strftime("%Y-%m-%d"), "Weight": float(w)} for d, w in zip(df["Date"], df["Weight"])]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"weights": data, "saved_at": datetime.now().isoformat()}, f, indent=2)
+
+
+def load_persisted(path: str = PERSIST_PATH) -> Optional[pd.DataFrame]:
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        rows = obj.get("weights", [])
+        df = pd.DataFrame(rows)
+        if df.empty:
+            return pd.DataFrame(columns=["Date", "Weight"])
+        df["Date"] = pd.to_datetime(df["Date"]).dt.date
+        df["Weight"] = pd.to_numeric(df["Weight"]).astype(float)
+        df, _ = _clean_inplace(df)
+        return df
+    except Exception:
+        return None
+
+
+def load_data(csv_path: Optional[str] = None, persisted_store: Optional[str] = PERSIST_PATH) -> pd.DataFrame:
+    """
+    Load dataset with priority: persisted store -> provided CSV -> default CSV path -> sample data.
+
+    Returns a cleaned DataFrame with columns [Date (date), Weight (float)].
+    """
+    # Try persisted store
+    if persisted_store:
+        df = load_persisted(persisted_store)
+        if df is not None and not df.empty:
+            return df
+
+    # Try provided CSV path
+    candidate_paths: List[str] = []
+    if csv_path:
+        candidate_paths.append(csv_path)
+    candidate_paths.append(DEFAULT_CSV_PATH)
+
+    for p in candidate_paths:
+        if p and os.path.exists(p):
+            try:
+                df = pd.read_csv(p)
+                df, _ = _clean_inplace(df)
+                return df
+            except Exception:
+                pass
+
+    # Fallback: sample data
+    df = pd.read_csv(StringIO(SAMPLE_CSV))
+    df, _ = _clean_inplace(df)
+    return df
+
+
+def add_or_update_entry(df: pd.DataFrame, entry_date: date, weight_lbs: float) -> pd.DataFrame:
+    """
+    Add or update an entry for a specific date.
+    """
+    entry_date = _ensure_date(entry_date)
+    weight_lbs = float(weight_lbs)
+
+    df = df.copy()
+    if (df["Date"] == entry_date).any():
+        df.loc[df["Date"] == entry_date, "Weight"] = weight_lbs
+    else:
+        df = pd.concat([df, pd.DataFrame([{"Date": entry_date, "Weight": weight_lbs}])], ignore_index=True)
+    df, _ = _clean_inplace(df)
+    return df
+
+
+def delete_entry(df: pd.DataFrame, entry_date: date) -> pd.DataFrame:
+    entry_date = _ensure_date(entry_date)
+    df = df.copy()
+    df = df[df["Date"] != entry_date].reset_index(drop=True)
+    df, _ = _clean_inplace(df)
+    return df
+
+
+def compute_rolling(df: pd.DataFrame, window: int = 7) -> pd.Series:
+    """
+    Compute a centered rolling average over logged days.
+
+    >>> _df = pd.DataFrame({"Date": pd.date_range("2025-01-01", periods=7).date, "Weight": [1,2,3,4,5,6,7]})
+    >>> compute_rolling(_df, 3).round(2).tolist()
+    [1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 6.5]
+    """
+    if df.empty:
+        return pd.Series(dtype=float)
+    s = df["Weight"].rolling(window=window, center=True, min_periods=max(1, window // 2)).mean()
+    # For edges where center cannot be applied, use trailing mean as a fallback
+    s = s.combine_first(df["Weight"].rolling(window=window, center=False, min_periods=1).mean())
+    return s
+
+
+def _week_resample_rule(week_start: str) -> str:
+    # Sunday–Saturday windows end Saturday => 'W-SAT'; Monday–Sunday windows end Sunday => 'W-SUN'
+    if week_start.lower().startswith("sun"):
+        return "W-SAT"
+    return "W-SUN"
+
+
+def _weekly_measure(series: pd.Series, count: pd.Series) -> Tuple[pd.Series, List[str]]:
+    """
+    Given weekly aggregated mean (series) and counts, choose weekly measure per definition:
+    - If count >= 3, use mean
+    - Else, use last value of that week (fallback) and record a note
+    Returns: (measure_series, notes)
+    """
+    notes: List[str] = []
+    measure = series.copy()
+    # Identify weeks with low counts
+    low_weeks = count[count < 3].index
+    if len(low_weeks) > 0:
+        notes.append(f"Weeks with <3 entries used last value fallback: {', '.join([d.strftime('%Y-%m-%d') for d in low_weeks])}")
+    return measure, notes
+
+
+def compute_weekly_metrics(df: pd.DataFrame, week_start: str = "Sunday") -> Dict[str, object]:
+    """
+    Compute weekly change metrics per definition.
+
+    Returns dict with keys:
+    - this_week_change
+    - last_week_change
+    - delta
+    - notes (list of strings)
+    - weekly_changes_df (for chart)
+
+    Doctest: ensure produces a numeric change for simple synthetic data under both week starts
+    >>> base = datetime(2025, 1, 1).date()
+    >>> df = pd.DataFrame({
+    ...     'Date': [base + timedelta(days=i) for i in range(14)],
+    ...     'Weight': [200 - 0.5*i for i in range(14)]
+    ... })
+    >>> m1 = compute_weekly_metrics(df, 'Sunday')
+    >>> m2 = compute_weekly_metrics(df, 'Monday')
+    >>> isinstance(m1['this_week_change'], float) and isinstance(m2['this_week_change'], float)
+    True
+    """
+    notes: List[str] = []
+    if df.empty:
+        return {"this_week_change": None, "last_week_change": None, "delta": None, "notes": ["No data"], "weekly_changes_df": pd.DataFrame()}
+
+    # Work with a DateTimeIndex for resampling
+    tmp = df.copy()
+    tmp["Date"] = pd.to_datetime(tmp["Date"])  # midnight naive
+    tmp = tmp.set_index("Date").sort_index()
+
+    rule = _week_resample_rule(week_start)
+
+    # Prepare weekly means, counts, and last values
+    weekly_mean = tmp["Weight"].resample(rule).mean()
+    weekly_count = tmp["Weight"].resample(rule).count()
+    weekly_last = tmp["Weight"].resample(rule).last()
+
+    # Fallback to last value if <3 entries
+    measure = weekly_mean.copy()
+    low_mask = weekly_count < 3
+    if low_mask.any():
+        measure[low_mask] = weekly_last[low_mask]
+        low_weeks = weekly_count[low_mask].index
+        notes.append(f"Weeks with <3 entries used last value fallback: {', '.join([d.strftime('%Y-%m-%d') for d in low_weeks])}")
+
+    # Compute weekly change: current week measure minus prior week measure
+    weekly_change = measure.diff()
+    weekly_df = pd.DataFrame({
+        "WeekEnd": weekly_change.index,
+        "WeeklyChange": weekly_change.values,
+        "WeeklyMeasure": measure.values,
+        "Count": weekly_count.values,
+    }).dropna(subset=["WeeklyChange"])  # drop first NaN diff
+
+    if weekly_df.empty:
+        # Not enough weeks to compare
+        return {
+            "this_week_change": None,
+            "last_week_change": None,
+            "delta": None,
+            "notes": notes + ["Not enough weekly data to compute change"],
+            "weekly_changes_df": pd.DataFrame(),
+        }
+
+    this_week_change = float(weekly_df.iloc[-1]["WeeklyChange"]) if len(weekly_df) >= 1 else None
+    last_week_change = float(weekly_df.iloc[-2]["WeeklyChange"]) if len(weekly_df) >= 2 else None
+    delta = (this_week_change - last_week_change) if (this_week_change is not None and last_week_change is not None) else None
+
+    return {
+        "this_week_change": this_week_change,
+        "last_week_change": last_week_change,
+        "delta": delta,
+        "notes": notes,
+        "weekly_changes_df": weekly_df,
+    }
+
+
+def _subset_by_days(df: pd.DataFrame, days: Optional[int]) -> pd.DataFrame:
+    if df.empty or not days:
+        return df.copy()
+    cutoff = df["Date"].max() - timedelta(days=days)
+    return df[df["Date"] >= cutoff].copy()
+
+
+def compute_trend(df: pd.DataFrame, windows: List[Optional[int]] = [60, None]) -> Dict[Optional[int], Dict[str, float]]:
+    """
+    Compute robust linear trend slope in lbs/day and lbs/week for the given windows (in days) and overall (None).
+    Returns a dict: {window: {slope_day, slope_week, r2}}
+
+    Doctest: slope units
+    >>> base = datetime(2025, 1, 1).date()
+    >>> df = pd.DataFrame({'Date': [base + timedelta(days=i) for i in range(10)], 'Weight': [200 - 1*i for i in range(10)]})
+    >>> t = compute_trend(df, windows=[None])[None]
+    >>> round(t['slope_day'], 1) == -1.0 and round(t['slope_week'], 1) == -7.0
+    True
+    """
+    results: Dict[Optional[int], Dict[str, float]] = {}
+
+    def fit_trend(local_df: pd.DataFrame) -> Tuple[float, float, float]:
+        if local_df is None or local_df.empty:
+            return float("nan"), float("nan"), float("nan")
+        x = pd.to_datetime(local_df["Date"]).map(pd.Timestamp.toordinal).to_numpy(dtype=float)
+        y = local_df["Weight"].to_numpy(dtype=float)
+        if len(x) < 2:
+            return float("nan"), float("nan"), float("nan")
+        if SCIPY_AVAILABLE and len(x) >= 3:
+            slope, intercept, _, _ = theilslopes(y, x)
+        else:
+            # Fallback to simple least squares
+            slope, intercept = np.polyfit(x, y, 1)
+        y_pred = slope * x + intercept
+        # R^2
+        ss_res = float(np.sum((y - y_pred) ** 2))
+        ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        slope_day = float(slope)
+        slope_week = slope_day * 7.0
+        return slope_day, slope_week, r2
+
+    for w in windows:
+        local_df = _subset_by_days(df, w) if w else df
+        slope_day, slope_week, r2 = fit_trend(local_df)
+        results[w] = {"slope_day": slope_day, "slope_week": slope_week, "r2": r2}
+
+    return results
+
+
+def compute_projection(df: pd.DataFrame, target_weight: Optional[float]) -> Dict[str, object]:
+    """
+    Using the last 28-day trend, estimate a projected date for reaching target_weight.
+    Returns {projected_date|None, method, caveats}
+
+    Doctest: projection logic for downward vs flat trend
+    >>> base = datetime(2025, 1, 1).date()
+    >>> df1 = pd.DataFrame({'Date': [base + timedelta(days=i) for i in range(28)], 'Weight': [200 - 0.5*i for i in range(28)]})
+    >>> p1 = compute_projection(df1, 180.0)
+    >>> p1['projected_date'] is not None
+    True
+    >>> df2 = pd.DataFrame({'Date': [base + timedelta(days=i) for i in range(28)], 'Weight': [200 for _ in range(28)]})
+    >>> p2 = compute_projection(df2, 180.0)
+    >>> p2['projected_date'] is None
+    True
+    """
+    caveats: List[str] = []
+    if target_weight is None or math.isnan(target_weight):
+        return {"projected_date": None, "method": "none", "caveats": ["No target weight set"]}
+    if df.empty:
+        return {"projected_date": None, "method": "theil-sen" if SCIPY_AVAILABLE else "ols", "caveats": ["No data"]}
+
+    last28 = _subset_by_days(df, 28)
+    if last28.empty or len(last28) < 10:
+        caveats.append("Low data volume in last 28 days; projection is unreliable")
+
+    trends = compute_trend(df, windows=[28])
+    slope_day = trends[28]["slope_day"]
+
+    current_weight = float(df.iloc[-1]["Weight"]) if not df.empty else None
+
+    if current_weight is None or np.isnan(slope_day):
+        return {"projected_date": None, "method": "theil-sen" if SCIPY_AVAILABLE else "ols", "caveats": ["Insufficient data for trend"]}
+
+    # If slope >= 0 (flat or gaining), no reliable projection
+    if slope_day >= 0:
+        return {"projected_date": None, "method": "linear-28d", "caveats": ["Trend is flat or gaining; no reliable projection"]}
+
+    # If already at/below target, projection is today
+    if current_weight <= target_weight:
+        return {"projected_date": df.iloc[-1]["Date"], "method": "linear-28d", "caveats": caveats}
+
+    days_needed = (target_weight - current_weight) / slope_day  # slope_day negative ⇒ positive days
+    if days_needed < 0 or not np.isfinite(days_needed):
+        return {"projected_date": None, "method": "linear-28d", "caveats": caveats + ["Unstable projection"]}
+
+    projected = df.iloc[-1]["Date"] + timedelta(days=float(days_needed))
+    return {"projected_date": projected, "method": "linear-28d", "caveats": caveats}
+
+
+def compute_adherence(df: pd.DataFrame) -> Dict[str, object]:
+    """
+    Compute logging consistency over last 30 days and longest streak over last 90 days.
+    Returns {pct_last_30, streak_last_90}
+    """
+    if df.empty:
+        return {"pct_last_30": 0.0, "streak_last_90": 0}
+
+    today = df["Date"].max()
+
+    # Last 30 days window inclusive
+    start_30 = today - timedelta(days=29)
+    mask_30 = (df["Date"] >= start_30) & (df["Date"] <= today)
+    days_logged = df.loc[mask_30, "Date"].nunique()
+    pct_30 = round(100.0 * days_logged / 30.0, 1)
+
+    # Longest streak in last 90 days
+    start_90 = today - timedelta(days=89)
+    dates_90 = sorted(set(d for d in df["Date"] if start_90 <= d <= today))
+    longest = 0
+    current = 0
+    prev = None
+    for d in dates_90:
+        if prev is None or (d - prev == timedelta(days=1)):
+            current += 1
+        else:
+            longest = max(longest, current)
+            current = 1
+        prev = d
+    longest = max(longest, current)
+
+    return {"pct_last_30": pct_30, "streak_last_90": int(longest)}
+
+
+def make_summary_text(metrics: Dict[str, object]) -> str:
+    """
+    Make a concise summary string from metrics bundle.
+
+    This function expects a dict containing:
+    - weekly: output from compute_weekly_metrics
+    - trend_28: slope_week (last 28 days)
+    - adherence: {pct_last_30, streak_last_90}
+    - projection: {projected_date}
+
+    >>> bundle = {
+    ...   'weekly': {'this_week_change': -1.6, 'last_week_change': -0.8, 'delta': -0.8, 'notes': []},
+    ...   'trend_28': {'slope_week': -1.1},
+    ...   'adherence': {'pct_last_30': 90.0, 'streak_last_90': 10},
+    ...   'projection': {'projected_date': date(2025, 10, 3)}
+    ... }
+    >>> s = make_summary_text(bundle)
+    >>> "Past week:" in s and "28-day trend:" in s
+    True
+    """
+    weekly = metrics.get("weekly", {})
+    this_week = weekly.get("this_week_change")
+    last_week = weekly.get("last_week_change")
+    slope_week = metrics.get("trend_28", {}).get("slope_week")
+    adherence = metrics.get("adherence", {})
+    pct = adherence.get("pct_last_30")
+    streak = adherence.get("streak_last_90")
+    projection = metrics.get("projection", {})
+    proj_date = projection.get("projected_date")
+
+    parts = []
+    if this_week is not None and last_week is not None:
+        parts.append(f"Past week: {this_week:+.1f} lb (vs {last_week:+.1f} lb last week)")
+    elif this_week is not None:
+        parts.append(f"Past week: {this_week:+.1f} lb")
+    if slope_week is not None and np.isfinite(slope_week):
+        parts.append(f"28-day trend: {slope_week:+.1f} lb/week")
+    if pct is not None and streak is not None:
+        # Estimate days logged as round(pct/100*30)
+        days_logged = int(round((pct / 100.0) * 30))
+        parts.append(f"Logging consistency: {pct:.0f}% ({days_logged}/30 days)")
+    if proj_date is not None:
+        parts.append(f"Projected to target by {proj_date:%b %d, %Y}")
+    else:
+        if projection.get("caveats"):
+            parts.append("No reliable projection")
+
+    return ". ".join(parts) + "."
+
+
+# Formatting helpers
+
+def _format_change(x: Optional[float]) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    sign = "+" if x > 0 else ""
+    return f"{sign}{x:.1f} lb"
+
+
+def _format_rate(x: Optional[float]) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    sign = "+" if x > 0 else ""
+    return f"{sign}{x:.2f} lb/wk"
+
+
+def _format_std(x: Optional[float]) -> str:
+    if x is None or not np.isfinite(x):
+        return "—"
+    return f"{x:.2f} lb"
+
+
+# Streamlit UI helpers
+
+def _copy_button(text: str, label: str = "Copy summary"):
+    """Render a one-click copy-to-clipboard button using a small HTML component."""
+    escaped = (text or "").replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+    components.html(
+        f"""
+        <button id=\"copybtn\" style=\"padding:6px 10px; border:1px solid #ccc; border-radius:4px; background:#f6f6f6; cursor:pointer;\">{label}</button>
+        <script>
+        const btn = document.getElementById('copybtn');
+        btn.addEventListener('click', async () => {{
+          try {{
+            await navigator.clipboard.writeText("{escaped}");
+            btn.innerText = 'Copied!';
+            setTimeout(()=>btn.innerText='{label}', 1500);
+          }} catch(e) {{
+            btn.innerText = 'Copy failed';
+            setTimeout(()=>btn.innerText='{label}', 1500);
+          }}
+        }});
+        </script>
+        """,
+        height=40,
+    )
+
+
+def _render_expandable_info(message: Optional[str], key_base: str) -> None:
+    """
+    Render a message inside an info-styled box that clamps long content with a gradient and a
+    keyboard-accessible toggle preserving state across reruns.
+
+    - Clamp threshold: >300 characters or >5 lines triggers the collapsed view
+    - State key: f"{key_base}" (boolean)
+    - Accessible toggle labels via button help text
+    - Break long words to avoid overflow
+    """
+    if not message:
+        return
+
+    message_str = str(message)
+    lines = message_str.splitlines() or [message_str]
+    needs_clamp = (len(message_str) > 300) or (len(lines) > 5)
+
+    if needs_clamp:
+        first_lines = lines[:5]
+        preview_concat = "\n".join(first_lines)
+        if len(preview_concat) > 300:
+            cut = preview_concat[:300]
+            if " " in cut:
+                cut = cut.rsplit(" ", 1)[0]
+            preview_concat = cut
+        preview_text = preview_concat.rstrip()
+    else:
+        preview_text = message_str
+
+    if key_base not in st.session_state:
+        st.session_state[key_base] = False
+    is_open = bool(st.session_state[key_base])
+
+    box_style = (
+        "border-left: 4px solid #1f77b4; "
+        "background: rgba(31,119,180,0.08); "
+        "padding: 10px 12px; border-radius: 4px;"
+    )
+
+    if not needs_clamp or is_open:
+        safe = html.escape(message_str)
+        st.markdown(
+            f"<div style=\"{box_style}\"><div style='white-space:pre-wrap; word-break:break-word;'>{safe}</div></div>",
+            unsafe_allow_html=True,
+        )
+        if needs_clamp:
+            if st.button("Show less", key=f"{key_base}_less_btn", help="Collapse message", use_container_width=False):
+                st.session_state[key_base] = False
+                st.rerun()
+    else:
+        safe_prev = html.escape(preview_text)
+        html_block = f"""
+        <div style=\"{box_style} position: relative;\">
+            <div style=\"white-space:pre-wrap; word-break:break-word; overflow:hidden; display:-webkit-box; -webkit-line-clamp:5; -webkit-box-orient:vertical;\">{safe_prev}</div>
+            <div aria-hidden=\"true\" style=\"position:absolute; left:0; right:0; bottom:0; height:2.5em; 
+                 background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0.92)); border-bottom-left-radius:4px; border-bottom-right-radius:4px;\"></div>
+        </div>
+        """
+        st.markdown(html_block, unsafe_allow_html=True)
+        if st.button("… Show more", key=f"{key_base}_more_btn", help="Expand message", use_container_width=False):
+            st.session_state[key_base] = True
+            st.rerun()
+
+
+def _confidence_badges(df: pd.DataFrame, weekly_notes: List[str], trend_28_count: int):
+    if len(df) < 7:
+        st.warning("Fewer than 7 data points; rolling averages may be noisy.")
+    if trend_28_count < 14:
+        st.warning("Fewer than 14 logged days in the last 28; 28‑day metrics are low confidence.")
+    for idx, note in enumerate(weekly_notes or []):
+        key_base = f"fallback_weeks_message_open_{idx}_{hashlib.md5(note.encode('utf-8')).hexdigest()[:8]}"
+        _render_expandable_info(note, key_base)
+
+
+# -------------------------------
+# Visualization helpers
+# -------------------------------
+
+def make_daily_chart(df: pd.DataFrame, show_roll7: bool = True, show_roll14: bool = False) -> go.Figure:
+    fig = go.Figure()
+    if df.empty:
+        fig.update_layout(title="Daily Weight", template="plotly_white")
+        return fig
+
+    x = df["Date"]
+    y = df["Weight"]
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers", name="Daily", hovertemplate="%{x|%Y-%m-%d}: %{y:.1f} lb"))
+
+    if show_roll7:
+        roll7 = compute_rolling(df, 7)
+        fig.add_trace(go.Scatter(x=x, y=roll7, mode="lines", name="7-day avg"))
+    if show_roll14:
+        roll14 = compute_rolling(df, 14)
+        fig.add_trace(go.Scatter(x=x, y=roll14, mode="lines", name="14-day avg"))
+
+    fig.update_layout(
+        title="Daily Weight & Rolling Averages",
+        xaxis_title="Date",
+        yaxis_title="Weight (lb)",
+        hovermode="x unified",
+        template="plotly_white",
+    )
+    return fig
+
+
+def make_weekly_change_chart(weekly_changes_df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if weekly_changes_df is None or weekly_changes_df.empty:
+        fig.update_layout(title="Weekly Change", template="plotly_white")
+        return fig
+
+    x = weekly_changes_df["WeekEnd"]
+    y = weekly_changes_df["WeeklyChange"]
+    colors = ["#2ca02c" if v < 0 else "#d62728" for v in y]  # green loss, red gain
+    fig.add_trace(go.Bar(x=x, y=y, marker_color=colors, name="Weekly change"))
+    fig.update_layout(
+        title="Weekly Change (vs prior week)",
+        xaxis_title="Week End",
+        yaxis_title="Δ Weight (lb)",
+        template="plotly_white",
+    )
+    return fig
+
+
+def get_roll7_series(df: pd.DataFrame) -> Dict[str, object]:
+    """
+    Return the 7-day rolling average series used by visuals with metadata.
+    - Primary: centered rolling mean with trailing fallback via compute_rolling(df, 7)
+    - Alt fallback: centered rolling mean with min_periods=4 and trailing fallback
+    """
+    if df.empty:
+        return {"series": pd.Series(dtype=float), "alt_series": pd.Series(dtype=float), "meta": {"centered_with_trailing_fallback": True}}
+    # Primary: reuse compute_rolling behavior
+    primary = compute_rolling(df, 7)
+    # Alt: min_periods=4 centered + trailing fallback
+    alt_centered = df["Weight"].rolling(window=7, center=True, min_periods=4).mean()
+    alt = alt_centered.combine_first(df["Weight"].rolling(window=7, center=False, min_periods=1).mean())
+    return {"series": primary, "alt_series": alt, "meta": {"centered_with_trailing_fallback": True}}
+
+
+def _compute_date_range(df: pd.DataFrame, mode: str, custom_start: Optional[date], custom_end: Optional[date]) -> Tuple[Optional[date], Optional[date], Optional[str]]:
+    """
+    Return (start_date, end_date, error_message) based on preset logic.
+    """
+    if df.empty:
+        return None, None, None
+    min_d = df["Date"].min()
+    max_d = df["Date"].max()
+
+    if mode == "All":
+        return min_d, max_d, None
+    if mode == "YTD":
+        start = date(max_d.year, 1, 1)
+        return start, max_d, None
+
+    days_map = {
+        "1W": 7,
+        "1M": 30,
+        "3M": 90,
+        "6M": 180,
+        "1Y": 365,
+    }
+    if mode in days_map:
+        start = max_d - timedelta(days=days_map[mode] - 1)
+        return max(min_d, start), max_d, None
+
+    if mode == "Custom":
+        if custom_start is None or custom_end is None:
+            return None, None, "Select start and end dates"
+        if custom_start > custom_end:
+            return None, None, "Start date must be on or before end date"
+        # Clamp to dataset bounds
+        return max(min_d, custom_start), min(max_d, custom_end), None
+
+    # Fallback to All
+    return min_d, max_d, None
+
+
+def _autoscale_y(y_arrays: List[np.ndarray]) -> Tuple[float, float]:
+    vals = np.concatenate([arr[~np.isnan(arr)] for arr in y_arrays if arr is not None and len(arr) > 0]) if y_arrays else np.array([])
+    if vals.size == 0:
+        return 0.0, 1.0
+    y_min = float(np.min(vals))
+    y_max = float(np.max(vals))
+    if not np.isfinite(y_min) or not np.isfinite(y_max):
+        return 0.0, 1.0
+    rng = y_max - y_min
+    if rng <= 0.0:
+        pad = 2.0
+    else:
+        pad = max(1.0, 0.05 * rng)
+    y0 = max(50.0, y_min - pad)
+    y1 = min(400.0, y_max + pad)
+    if y1 - y0 < 2.0:
+        # Ensure visible span
+        mid = 0.5 * (y0 + y1)
+        y0, y1 = mid - 1.0, mid + 1.0
+    return y0, y1
+
+
+def compute_avg_rate(df: pd.DataFrame, lookback_days: Optional[int] = None, start_date: Optional[date] = None, end_date: Optional[date] = None) -> Dict[str, object]:
+    """
+    Compute average change per day and per week using smoothed endpoints by default.
+    - Window: [start_date, end_date] inclusive; if lookback_days provided, derive from max date
+    - Smoothed endpoints: use roll-7 at the first/last in-range dates where roll-7 exists.
+      If missing, try alt (min_periods=4). If still missing, fall back to raw weights at those dates.
+    Returns: dict with status, avg_per_day, avg_per_week, start_date, end_date, days_elapsed,
+             start_value_type (roll7|roll7_alt|raw), end_value_type, roll7_start, roll7_end,
+             used_fallback_raw (bool), debug_lines
+    """
+    if df.empty:
+        return {"status": "no_data"}
+    df2 = df.copy().dropna(subset=["Date", "Weight"]).sort_values("Date")
+    max_d = df2["Date"].max()
+    if end_date is None:
+        end_date = max_d
+    if start_date is None:
+        if lookback_days is None or lookback_days <= 0:
+            start_date = df2["Date"].min()
+        else:
+            start_date = max(end_date - timedelta(days=int(lookback_days) - 1), df2["Date"].min())
+    sub = df2[(df2["Date"] >= start_date) & (df2["Date"] <= end_date)].copy()
+    sub = sub.sort_values("Date")
+    debug_lines: List[str] = []
+    lookback_label_days = (end_date - start_date).days + 1
+    debug_lines.append(f"DEBUG AvgRate — Lookback:{lookback_label_days} start:{start_date} end:{end_date}")
+    if len(sub) < 2:
+        return {"status": "insufficient_data", "debug_lines": debug_lines}
+
+    # Get roll-7 series computed on full dataset
+    roll = get_roll7_series(df2)
+    r_primary: pd.Series = roll["series"]
+    r_alt: pd.Series = roll["alt_series"]
+    # Align with df2 index
+    # Find first and last in-range indices with non-null roll7
+    mask = (df2["Date"] >= start_date) & (df2["Date"] <= end_date)
+    idx_in_range = df2.index[mask]
+    # Start endpoint
+    start_idx = next((i for i in idx_in_range if pd.notna(r_primary.iloc[i])), None)
+    end_idx = next((i for i in reversed(idx_in_range.tolist()) if pd.notna(r_primary.iloc[i])), None)
+    start_type = "roll7"
+    end_type = "roll7"
+    used_fallback_raw = False
+    roll7_start = None
+    roll7_end = None
+    # Fallback to alt if needed
+    if start_idx is None or end_idx is None:
+        if start_idx is None:
+            start_idx = next((i for i in idx_in_range if pd.notna(r_alt.iloc[i])), None)
+            if start_idx is not None:
+                start_type = "roll7_alt"
+        if end_idx is None:
+            end_idx = next((i for i in reversed(idx_in_range.tolist()) if pd.notna(r_alt.iloc[i])), None)
+            if end_idx is not None:
+                end_type = "roll7_alt"
+    # If still missing, fall back to raw at endpoints
+    if start_idx is None:
+        start_idx = int(idx_in_range.min())
+        start_type = "raw"
+        used_fallback_raw = True
+        roll7_start = float(df2.iloc[start_idx]["Weight"]) if start_idx is not None else None
+    else:
+        roll7_start = float(r_primary.iloc[start_idx]) if start_type == "roll7" else float(r_alt.iloc[start_idx])
+    if end_idx is None:
+        end_idx = int(idx_in_range.max())
+        end_type = "raw"
+        used_fallback_raw = True or used_fallback_raw
+        roll7_end = float(df2.iloc[end_idx]["Weight"]) if end_idx is not None else None
+    else:
+        roll7_end = float(r_primary.iloc[end_idx]) if end_type == "roll7" else float(r_alt.iloc[end_idx])
+
+    endpoint_start_date = df2.iloc[start_idx]["Date"] if start_idx is not None else None
+    endpoint_end_date = df2.iloc[end_idx]["Date"] if end_idx is not None else None
+    if endpoint_start_date is None or endpoint_end_date is None:
+        return {"status": "insufficient_data", "debug_lines": debug_lines}
+    days_elapsed = (endpoint_end_date - endpoint_start_date).days
+    debug_lines.append(f"w_start:{roll7_start} w_end:{roll7_end} days:{days_elapsed}")
+    if days_elapsed < 1:
+        return {"status": "insufficient_data", "debug_lines": debug_lines}
+    avg_day = (roll7_end - roll7_start) / days_elapsed
+    avg_week = avg_day * 7.0
+    debug_lines.append(f"avg/day:{avg_day} avg/week:{avg_week}")
+    return {
+        "status": "ok",
+        "avg_per_day": float(round(avg_day, 6)),
+        "avg_per_week": float(round(avg_week, 6)),
+        "start_date": endpoint_start_date,
+        "end_date": endpoint_end_date,
+        "days_elapsed": int(days_elapsed),
+        "w_start": roll7_start,
+        "w_end": roll7_end,
+        "start_value_type": start_type,
+        "end_value_type": end_type,
+        "used_fallback_raw": used_fallback_raw,
+        "debug_lines": debug_lines,
+    }
+
+
+# -------------------------------
+# Ask Gym Monster - Chat tools and panel
+# -------------------------------
+
+def tool_compute_metric(df: pd.DataFrame, metric_name: str, start_date: date, end_date: date, options: Optional[Dict] = None) -> Dict:
+    options = options or {}
+    # Implement a few core metrics
+    data = df[(df["Date"] >= start_date) & (df["Date"] <= end_date)].copy()
+    data = data.sort_values("Date")
+    if data.empty or len(data) <= 3:
+        return {"ok": False, "error": "Insufficient data in range", "start": start_date, "end": end_date}
+    if metric_name == "avg_daily_change":
+        # Use start-to-end over elapsed days to avoid sampling bias
+        res = compute_avg_rate(data, start_date=start_date, end_date=end_date)
+        if res.get("status") != "ok":
+            return {"ok": False, "error": "Cannot compute rate", "start": start_date, "end": end_date}
+        return {"ok": True, "value_day": res["avg_per_day"], "value_week": res["avg_per_week"], "units": "lb/day", "start": res["start_date"], "end": res["end_date"], "method": "start-to-end over elapsed days"}
+    if metric_name == "total_change":
+        total = float(data["Weight"].iloc[-1] - data["Weight"].iloc[0])
+        return {"ok": True, "value": total, "units": "lb", "start": start_date, "end": end_date, "method": "difference between first and last in range"}
+    if metric_name == "biggest_week_drop":
+        # Use current week_start setting Sunday for consistency here
+        weekly = compute_weekly_metrics(df, week_start="Sunday").get("weekly_changes_df")
+        if weekly is None or weekly.empty:
+            return {"ok": False, "error": "No weekly data", "start": start_date, "end": end_date}
+        w = weekly[(weekly["WeekEnd"].dt.date >= start_date) & (weekly["WeekEnd"].dt.date <= end_date)]
+        if w.empty:
+            return {"ok": False, "error": "No weekly data in range", "start": start_date, "end": end_date}
+        idx = int(w["WeeklyChange"].idxmin())
+        row = w.loc[idx]
+        return {"ok": True, "week_end": row["WeekEnd"].date(), "change": float(row["WeeklyChange"]), "units": "lb", "start": start_date, "end": end_date, "method": "weekly change vs prior week"}
+    return {"ok": False, "error": "Unknown metric", "start": start_date, "end": end_date}
+
+
+def tool_describe_dataset(df: pd.DataFrame, snapshot_level: str = "brief") -> Dict:
+    if df.empty:
+        return {"ok": True, "count": 0}
+    min_d = df["Date"].min()
+    max_d = df["Date"].max()
+    desc = {
+        "ok": True,
+        "count": int(len(df)),
+        "date_min": min_d,
+        "date_max": max_d,
+        "min": float(df["Weight"].min()),
+        "max": float(df["Weight"].max()),
+        "mean": float(df["Weight"].mean()),
+        "last_weigh_in": {"date": df.iloc[-1]["Date"], "weight": float(df.iloc[-1]["Weight"])},
+    }
+    if snapshot_level == "full":
+        # Count missing calendar days in span
+        all_days = pd.date_range(min_d, max_d, freq="D").date
+        logged_days = set(df["Date"]) if not df.empty else set()
+        desc["missing_days"] = int(sum(1 for d in all_days if d not in logged_days))
+    return desc
+
+
+def tool_project_goal_date(df: pd.DataFrame, current_weight: float, goal_weight: float, lookback_days: int, options: Optional[Dict] = None) -> Dict:
+    options = options or {}
+    if df.empty or lookback_days <= 0:
+        return {"ok": False, "error": "No data"}
+    # Use unified avg rate helper
+    rate = compute_avg_rate(df, lookback_days=lookback_days)
+    if rate.get("status") != "ok":
+        return {"ok": False, "error": "Not enough recent data"}
+    slope_day = rate["avg_per_day"]
+    slope_week = rate["avg_per_week"]
+    w_now = rate["w_end"]
+    eps = 0.02
+    if abs(slope_day) < eps:
+        return {"ok": False, "error": "Insufficient trend to project", "slope_day": slope_day, "slope_week": slope_week}
+    moving_towards = (w_now > goal_weight and slope_day < 0) or (w_now < goal_weight and slope_day > 0)
+    if not moving_towards:
+        return {"ok": False, "error": f"Not on track at current trend (gaining {slope_week:+.2f}/week)", "slope_day": slope_day, "slope_week": slope_week}
+    days_to_goal = abs((w_now - goal_weight) / slope_day)
+    if not np.isfinite(days_to_goal):
+        return {"ok": False, "error": "Projection unstable", "slope_day": slope_day, "slope_week": slope_week}
+    projected = rate["end_date"] + timedelta(days=int(math.ceil(days_to_goal)))
+    years = (projected - rate["end_date"]).days / 365.25
+    if years > 5:
+        return {"ok": False, "error": "Projection too uncertain; widen lookback", "slope_day": slope_day, "slope_week": slope_week}
+    return {"ok": True, "projected_date": projected, "slope_day": slope_day, "slope_week": slope_week, "lookback_days": lookback_days, "used_fallback_raw": bool(rate.get("used_fallback_raw"))}
+
+
+def _render_chat_panel():
+    st.markdown("Made with AI. Numbers come from your current dataset.")
+    # Env guard
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        st.info("Set OPENAI_API_KEY in your environment to enable Ask Gym Monster.")
+        return
+
+    st.session_state.setdefault("chat_history", [])  # list of {role, content}
+    # Quick insertables
+    inserts = [
+        "What's my average change in the last 4 months?",
+        "Project my goal date",
+        "Which week had the biggest drop?",
+        "Why was week X volatile?",
+    ]
+    ins_cols = st.columns(len(inserts))
+    for i, txt in enumerate(inserts):
+        with ins_cols[i]:
+            if st.button(txt, key=f"ins_{i}"):
+                st.session_state["chat_prefill"] = txt
+
+    # Input
+    prefill = st.session_state.get("chat_prefill", "")
+    prompt = st.text_input("Ask Gym Monster", value=prefill, key="ask_input")
+    ask = st.button("Ask", key="ask_send")
+
+    # Minimal LLM wrapper (pseudo streaming via incremental write). We'll stub logic and use tools directly here.
+    # A real implementation would call an LLM with a system prompt and tool schema, but here we route simple intents.
+    if ask and prompt.strip():
+        st.session_state["chat_prefill"] = ""
+        st.session_state["chat_history"].append({"role": "user", "content": prompt})
+        df = st.session_state.df
+        min_d = df["Date"].min() if not df.empty else None
+        max_d = df["Date"].max() if not df.empty else None
+
+        # Simple intent routing for the required examples
+        lower = prompt.lower()
+        with st.chat_message("assistant"):
+            if df.empty:
+                st.write("I don't see any data yet. Upload a CSV to get started.")
+            elif "average" in lower and ("4 months" in lower or "four months" in lower):
+                start = max_d - timedelta(days=120)
+                res = tool_compute_metric(df, "avg_daily_change", start, max_d)
+                if not res.get("ok"):
+                    st.write("Not enough data in that window. Try a longer range.")
+                else:
+                    st.write(f"Average rate from {start:%b %d, %Y} to {max_d:%b %d, %Y}: {res['value_day']:+.2f} lb/day ({res['value_week']:+.2f} lb/week).")
+            elif "how much" in lower and ("july" in lower):
+                # July of max year within dataset
+                year = max_d.year
+                start = date(year, 7, 1)
+                end = date(year, 7, 31)
+                res = tool_compute_metric(df, "total_change", start, end)
+                if not res.get("ok"):
+                    st.write("No sufficient data in July for that year.")
+                else:
+                    st.write(f"Change in July {year}: {res['value']:+.2f} lb (from {start:%b %d} to {end:%b %d}).")
+            elif "biggest drop" in lower and "week" in lower:
+                start = min_d
+                end = max_d
+                res = tool_compute_metric(df, "biggest_week_drop", start, end)
+                if not res.get("ok"):
+                    st.write("No weekly data available in that range.")
+                else:
+                    we = res["week_end"]
+                    st.write(f"Biggest weekly drop ended {we:%b %d, %Y}: {res['change']:+.2f} lb.")
+            elif "project" in lower and ("goal" in lower or "reach" in lower):
+                current = float(df.iloc[-1]["Weight"]) if not df.empty else None
+                goal = st.session_state.get("chat_goal_weight", 180.0)
+                lookback = st.session_state.get("chat_lookback_days", 28)
+                res = tool_project_goal_date(df, current, goal, lookback)
+                if not res.get("ok"):
+                    msg = res.get("error", "Cannot project with current data.")
+                    st.write(msg)
+                else:
+                    d = res["projected_date"]
+                    st.write(f"Projected to reach {goal:.1f} lb by {d:%b %d, %Y} based on last {res['lookback_days']} days ({res['slope_week']:+.2f} lb/week).")
+                    if res.get("used_fallback_raw"):
+                        st.info("Used raw endpoints due to insufficient roll‑7 at window edges.")
+                    # DEBUG projection log
+                    w_now = float(st.session_state.df.iloc[-1]["Weight"]) if not st.session_state.df.empty else None
+                    days_to_goal = None
+                    if res.get("slope_day") is not None and w_now is not None and res["slope_day"] != 0:
+                        days_to_goal = abs((w_now - float(goal)) / res["slope_day"]) if np.isfinite(res["slope_day"]) else None
+                    debug_proj = f"DEBUG Projection — w_now:{w_now} goal:{float(goal)} slope_day:{res.get('slope_day')} days_to_goal:{days_to_goal} projected_date:{d}"
+                    st.code(debug_proj)
+            else:
+                st.write("I can answer questions about your rates, changes by month, biggest weekly drops, and goal projections. Try the insert buttons above.")
+
+
+# Cache data between interactions
+@st.cache_data(show_spinner=False)
+def _load_initial_data(csv_path: Optional[str]) -> pd.DataFrame:
+    return load_data(csv_path)
+
+
+# Main UI
+def main():
+    st.set_page_config(page_title="Gym Monster", layout="wide")
+    st.title("Gym Monster")
+    st.caption("Your weight trends, explained.")
+
+    # Sidebar/left controls vs insights on right
+    left, right = st.columns([1, 1])
+
+    with left:
+        st.subheader("Gym Monster • Data & Controls")
+        st.caption("Your weight trends, explained.")
+
+        # File import
+        st.markdown("""Use the file uploader to import your CSV (Date,Weight). If omitted, the app will look for ./weights.csv or use a small sample.""")
+        uploaded = st.file_uploader("Import CSV", type=["csv"], accept_multiple_files=False)
+
+        # Load initial data (persisted > uploader > default path > sample)
+        initial_csv_path = None
+        if uploaded is not None:
+            try:
+                tmp_df = pd.read_csv(uploaded)
+                tmp_df, stats = _clean_inplace(tmp_df)
+                # Adopt uploaded dataset
+                df = tmp_df
+                st.success(f"Gym Monster imported {len(df):,} rows. Dropped {stats['dropped_nulls']:,} nulls, deduped {stats['deduped']:,}.")
+                # Persist immediately
+                save_data(df)
+            except Exception as e:
+                st.error(f"Failed to read CSV: {e}")
+                df = _load_initial_data(None)
+        else:
+            # Load from persisted store or defaults
+            df = _load_initial_data(initial_csv_path)
+
+        # Make df editable via our controls; persist changes
+        if "df" not in st.session_state:
+            st.session_state.df = df
+        else:
+            # If upload occurred, replace session df
+            if uploaded is not None:
+                st.session_state.df = df
+
+        # Week toggle
+        week_start = st.radio("Week start", ["Sunday", "Monday"], index=0, horizontal=True)
+
+        # Target weight
+        current_weight = float(st.session_state.df["Weight"].iloc[-1]) if not st.session_state.df.empty else None
+        target_weight = st.number_input(
+            "Target weight (lb)",
+            value=float(round((current_weight - 10.0), 1)) if current_weight is not None else 180.0,
+            step=0.1,
+            format="%.1f",
+        )
+        # Lookback selection for projection
+        st.session_state.setdefault("projection_lookback_mode", "28 days")
+        st.session_state.setdefault("projection_custom_days", 28)
+        lookback_options = ["21 days", "28 days", "60 days", "90 days", "Custom"]
+        st.markdown("### Projection Lookback")
+        st.session_state["projection_lookback_mode"] = st.selectbox(
+            "Lookback window",
+            lookback_options,
+            index=lookback_options.index(st.session_state["projection_lookback_mode"]) if st.session_state["projection_lookback_mode"] in lookback_options else 1,
+        )
+        if st.session_state["projection_lookback_mode"] == "Custom":
+            st.session_state["projection_custom_days"] = st.number_input("Custom lookback days", min_value=7, max_value=1000, value=st.session_state["projection_custom_days"], step=1)
+        # Mirror to chat state
+        lb_map = {"21 days": 21, "28 days": 28, "60 days": 60, "90 days": 90}
+        st.session_state["chat_lookback_days"] = lb_map.get(st.session_state["projection_lookback_mode"], st.session_state.get("projection_custom_days", 28))
+        st.session_state["chat_goal_weight"] = target_weight
+
+        st.divider()
+        st.markdown("### Add or Update Entry (Gym Monster)")
+        entry_date = st.date_input("Date", value=date.today())
+        entry_weight = st.number_input("Weight (lb)", value=float(current_weight) if current_weight is not None else 180.0, step=0.1, format="%.1f")
+        overwrite_needed = (st.session_state.df["Date"] == entry_date).any()
+        if overwrite_needed:
+            st.info("An entry for this date exists.")
+            confirm_overwrite = st.checkbox("Confirm overwrite existing entry", value=False, key="confirm_overwrite")
+        else:
+            confirm_overwrite = True
+        if st.button("Add / Update", use_container_width=True):
+            if overwrite_needed and not confirm_overwrite:
+                st.warning("Please confirm overwrite or change the date.")
+            else:
+                st.session_state.df = add_or_update_entry(st.session_state.df, entry_date, entry_weight)
+                save_data(st.session_state.df)
+                st.success("Entry saved.")
+
+        st.markdown("### Edit / Delete Existing (Gym Monster)")
+        if not st.session_state.df.empty:
+            dates = list(st.session_state.df["Date"].astype(str))
+            selection = st.selectbox("Select date", options=dates, index=len(dates) - 1)
+            if selection:
+                sel_date = datetime.strptime(selection, "%Y-%m-%d").date()
+                sel_weight = float(st.session_state.df.loc[st.session_state.df["Date"] == sel_date, "Weight"].iloc[0])
+                new_weight = st.number_input("New weight (lb)", value=sel_weight, step=0.1, format="%.1f", key="edit_weight")
+                cols = st.columns(2)
+                with cols[0]:
+                    if st.button("Save edit", use_container_width=True):
+                        st.session_state.df = add_or_update_entry(st.session_state.df, sel_date, new_weight)
+                        save_data(st.session_state.df)
+                        st.success("Saved.")
+                with cols[1]:
+                    confirm_delete = st.checkbox("Confirm delete", value=False, key="confirm_delete")
+                    if st.button("Delete", use_container_width=True):
+                        if not confirm_delete:
+                            st.warning("Please check 'Confirm delete' before deleting.")
+                        else:
+                            st.session_state.df = delete_entry(st.session_state.df, sel_date)
+                            save_data(st.session_state.df)
+                            st.success("Deleted.")
+
+        st.divider()
+        # Export current dataset
+        csv_bytes = st.session_state.df.to_csv(index=False).encode("utf-8") if not st.session_state.df.empty else b"Date,Weight\n"
+        st.download_button("Export CSV", data=csv_bytes, file_name="weights_export.csv", mime="text/csv", use_container_width=True)
+
+    with right:
+        st.subheader("Gym Monster • Insights")
+        df = st.session_state.df
+
+        # Rolling averages toggles
+        show_roll14 = st.toggle("Show 14‑day rolling average", value=False)
+
+        # Weekly metrics
+        weekly = compute_weekly_metrics(df, week_start=week_start)
+
+        # Daily change volatility over last 28 logged days
+        if len(df) >= 2:
+            daily_change = df["Weight"].diff().dropna()
+            last28_idx = max(0, len(daily_change) - 28)
+            vol_28 = float(daily_change.iloc[last28_idx:].std()) if len(daily_change.iloc[last28_idx:]) > 0 else float("nan")
+        else:
+            vol_28 = float("nan")
+
+        # Trends
+        trends = compute_trend(df, windows=[60, None])
+        trend_60 = trends.get(60, {"slope_day": float("nan"), "slope_week": float("nan"), "r2": float("nan")})
+        trend_all = trends.get(None, {"slope_day": float("nan"), "slope_week": float("nan"), "r2": float("nan")})
+
+        # Projection
+        projection = compute_projection(df, target_weight)
+
+        # Adherence
+        adherence = compute_adherence(df)
+
+        # Cards layout
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("This week change", _format_change(weekly.get("this_week_change")))
+            st.metric("Last week change", _format_change(weekly.get("last_week_change")))
+        with c2:
+            st.metric("Delta (this - last)", _format_change(weekly.get("delta")))
+            st.metric("Avg rate (28d)", _format_rate(compute_trend(df, windows=[28])[28]["slope_week"]))
+        with c3:
+            st.metric("Avg rate (overall)", _format_rate(trend_all.get("slope_week")))
+            st.metric("Volatility (28d sd)", _format_std(vol_28))
+
+        c4, c5 = st.columns(2)
+        with c4:
+            st.metric("Trend 60d", _format_rate(trend_60.get("slope_week")))
+        with c5:
+            st.metric("Trend overall", _format_rate(trend_all.get("slope_week")))
+
+        # Projected Date to Goal card
+        st.markdown("#### Projected Date to Goal")
+        proj_col, info_col = st.columns([2,1])
+        with proj_col:
+            lookback_days = st.session_state.get("chat_lookback_days", 28)
+            if target_weight is None or not np.isfinite(target_weight):
+                st.write("Set a target to see a projection.")
+            elif st.session_state.df.empty:
+                st.write("No data.")
+            else:
+                current = float(st.session_state.df.iloc[-1]["Weight"]) if not st.session_state.df.empty else None
+                # Already at/beyond goal within tolerance
+                tol = 0.5
+                if current is not None and current <= target_weight + tol:
+                    reached_date = st.session_state.df.loc[st.session_state.df["Weight"] <= target_weight + tol, "Date"].max()
+                    st.success(f"Goal reached 🎉 on {reached_date:%b %d, %Y}")
+                else:
+                    res = tool_project_goal_date(st.session_state.df, current, float(target_weight), int(lookback_days))
+                    if not res.get("ok"):
+                        msg = res.get("error", "Not enough recent data to project.")
+                        st.info(msg)
+                    else:
+                        d = res["projected_date"]
+                        slope_week = res["slope_week"]
+                        st.metric("Projected Date", f"{d:%b %d, %Y}")
+                        st.caption(f"Based on last {res['lookback_days']} days ({slope_week:+.2f} lb/week).")
+                        if res.get("used_fallback_raw"):
+                            st.info("Used raw endpoints due to insufficient roll‑7 at window edges.")
+                        # DEBUG projection log
+                        w_now = float(st.session_state.df.iloc[-1]["Weight"]) if not st.session_state.df.empty else None
+                        days_to_goal = None
+                        if res.get("slope_day") is not None and w_now is not None and res["slope_day"] != 0:
+                            days_to_goal = abs((w_now - float(target_weight)) / res["slope_day"]) if np.isfinite(res["slope_day"]) else None
+                        debug_proj = f"DEBUG Projection — w_now:{w_now} goal:{float(target_weight)} slope_day:{res.get('slope_day')} days_to_goal:{days_to_goal} projected_date:{d}"
+                        st.code(debug_proj)
+        with info_col:
+            st.info("Linear projection based on your recent average change. Informational only.")
+
+        # Average rate (selected lookback) debug block
+        st.markdown("#### Average Rate (Selected Lookback)")
+        lb = st.session_state.get("chat_lookback_days", 28)
+        rate = compute_avg_rate(st.session_state.df, lookback_days=int(lb))
+        if rate.get("status") == "no_data":
+            st.info("No data.")
+        elif rate.get("status") == "insufficient_data":
+            st.info("Not enough data to compute rate.")
+            dbg = "\n".join(rate.get("debug_lines", []))
+            st.code(dbg)
+        else:
+            st.metric("Avg change/week", f"{rate['avg_per_week']:+.2f} lb/week")
+            st.caption(f"Based on last {lb} days ({rate['start_date']}–{rate['end_date']}).")
+            dbg = "\n".join(rate.get("debug_lines", []))
+            st.code(dbg)
+
+        # Confidence badges and notes
+        trend_28_count = len(_subset_by_days(df, 28))
+        _confidence_badges(df, weekly.get("notes", []), trend_28_count)
+
+        st.divider()
+
+        # Unified summary using active lookback and smoothed endpoints
+        lb = st.session_state.get("chat_lookback_days", 28)
+        rate_sum = compute_avg_rate(df, lookback_days=int(lb))
+        proj_sum = tool_project_goal_date(df, float(df.iloc[-1]["Weight"]) if not df.empty else float("nan"), target_weight, int(lb))
+        # Logging consistency over active window
+        if rate_sum.get("status") == "ok":
+            s_d = rate_sum["start_date"]
+            e_d = rate_sum["end_date"]
+            span_days = (e_d - s_d).days + 1
+            dates_in = pd.date_range(s_d, e_d, freq="D").date
+            num_logged = int(sum(1 for d0 in dates_in if d0 in set(df["Date"])))
+            pct_log = round(100.0 * num_logged / span_days, 0)
+        else:
+            s_d = e_d = None
+            pct_log = 0.0
+            num_logged = 0
+            span_days = 0
+        trend_week = (rate_sum.get("avg_per_week") if rate_sum.get("status") == "ok" else None)
+        proj_date = (proj_sum.get("projected_date") if proj_sum.get("ok") else None)
+        # Weekly comparisons using roll-7 deltas
+        r = get_roll7_series(df)
+        rser = r["series"]
+        roll_end = rate_sum.get("end_date") if rate_sum.get("status") == "ok" else (df["Date"].max() if not df.empty else None)
+        notes = []
+        this_week_change = last_week_change = None
+        if roll_end is not None:
+            # find indices by date
+            idx_map = {d: i for i, d in enumerate(df["Date"]) }
+            if roll_end in idx_map:
+                i_end = idx_map[roll_end]
+                def r_at(delta_days: int) -> Optional[float]:
+                    # get roll-7 at exact date - delta_days, else None
+                    target = roll_end - timedelta(days=delta_days)
+                    return float(rser.iloc[idx_map[target]]) if target in idx_map and pd.notna(rser.iloc[idx_map[target]]) else None
+                r0 = r_at(0)
+                r7 = r_at(7)
+                r14 = r_at(14)
+                if r0 is not None and r7 is not None:
+                    this_week_change = r0 - r7
+                if r7 is not None and r14 is not None:
+                    last_week_change = r7 - r14
+                if this_week_change is None or last_week_change is None:
+                    notes.append("Rolling average endpoints missing; weekly comparison skipped.")
+        summary_payload = {
+            "weekly": {"this_week_change": this_week_change, "last_week_change": last_week_change, "delta": (this_week_change - last_week_change) if this_week_change is not None and last_week_change is not None else None, "notes": notes},
+            "trend_lookback": {"slope_week": trend_week},
+            "adherence": {"pct_last_30": pct_log, "streak_last_90": None},
+            "projection": {"projected_date": proj_date},
+        }
+        summary_text = make_summary_text(summary_payload)
+        st.text_area("Summary", value=summary_text, height=60)
+        ask_clicked = st.button("Ask Gym Monster", help="Open chat and prefill with this summary", use_container_width=False)
+        if ask_clicked:
+            st.session_state.setdefault("ask_gm_open", True)
+            st.session_state["ask_gm_open"] = True
+            st.session_state.setdefault("chat_prefill", "")
+            st.session_state["chat_prefill"] = summary_text
+
+        # Chat panel (Ask Gym Monster)
+        with st.expander("Ask Gym Monster", expanded=st.session_state.get("ask_gm_open", False)):
+            _render_chat_panel()
+
+    st.divider()
+
+    # Main area: charts and table
+    st.subheader("Gym Monster • Charts & Table")
+
+    # Charts
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        # Range controls block
+        if "range_mode" not in st.session_state:
+            st.session_state.range_mode = "All"
+        if "custom_start" not in st.session_state:
+            st.session_state.custom_start = None
+        if "custom_end" not in st.session_state:
+            st.session_state.custom_end = None
+
+        st.markdown("#### Range")
+        modes = ["1W", "1M", "3M", "6M", "1Y", "YTD", "All", "Custom"]
+        st.session_state.range_mode = st.radio(
+            "Date range", options=modes, index=modes.index(st.session_state.range_mode), horizontal=True, key="range_mode_radio"
+        )
+
+        if st.session_state.range_mode == "Custom":
+            cstart, cend = st.columns(2)
+            with cstart:
+                st.session_state.custom_start = st.date_input("Start", value=st.session_state.custom_start)
+            with cend:
+                st.session_state.custom_end = st.date_input("End", value=st.session_state.custom_end)
+
+        # Compute range
+        start_d, end_d, err = _compute_date_range(st.session_state.df, st.session_state.range_mode, st.session_state.custom_start, st.session_state.custom_end)
+        if err:
+            st.error(err)
+        else:
+            # Prepare series: compute rolling on full data then filter
+            df_full = st.session_state.df
+            roll7_full = compute_rolling(df_full, 7)
+            roll14_full = compute_rolling(df_full, 14) if show_roll14 else None
+
+            mask = (df_full["Date"] >= start_d) & (df_full["Date"] <= end_d)
+            df_vis = df_full.loc[mask].reset_index(drop=True)
+
+            if df_vis.empty:
+                st.warning("No data in selected range")
+            else:
+                # Visible arrays for autoscale
+                y_arrays = [df_vis["Weight"].to_numpy(dtype=float)]
+                if roll7_full is not None:
+                    y_arrays.append(roll7_full.loc[mask].to_numpy(dtype=float))
+                if roll14_full is not None:
+                    y_arrays.append(roll14_full.loc[mask].to_numpy(dtype=float))
+                # Y-axis mode: Auto | Manual
+                st.session_state.setdefault("daily_y_mode", "Auto")
+                st.session_state.setdefault("daily_y_min", 100.0)
+                st.session_state.setdefault("daily_y_max", 200.0)
+                st.session_state.daily_y_mode = st.radio("Y-axis mode", ["Auto", "Manual"], index=0 if st.session_state.daily_y_mode == "Auto" else 1, horizontal=True, key="daily_y_mode_radio")
+                if st.session_state.daily_y_mode == "Manual":
+                    cmin, cmax = st.columns(2)
+                    with cmin:
+                        st.session_state.daily_y_min = st.number_input("Y min", value=float(st.session_state.daily_y_min))
+                    with cmax:
+                        st.session_state.daily_y_max = st.number_input("Y max", value=float(st.session_state.daily_y_max))
+                    y0, y1 = float(st.session_state.daily_y_min), float(st.session_state.daily_y_max)
+                    if st.button("Reset to Auto (daily)"):
+                        st.session_state.daily_y_mode = "Auto"
+                        st.rerun()
+                else:
+                    y0, y1 = _autoscale_y(y_arrays)
+
+                # Build figure using filtered data, but plot rolling from filtered slices
+                fig = go.Figure()
+                x = df_vis["Date"]
+                y = df_vis["Weight"]
+                fig.add_trace(go.Scatter(x=x, y=y, mode="lines+markers", name="Daily", hovertemplate="%{x|%Y-%m-%d}: %{y:.1f} lb"))
+                # Rolling 7
+                roll7_vis = roll7_full.loc[mask]
+                fig.add_trace(go.Scatter(x=x, y=roll7_vis.values, mode="lines", name="7-day avg"))
+                # Rolling 14
+                if show_roll14 and roll14_full is not None:
+                    roll14_vis = roll14_full.loc[mask]
+                    fig.add_trace(go.Scatter(x=x, y=roll14_vis.values, mode="lines", name="14-day avg"))
+
+                fig.update_layout(
+                    title="Daily Weight & Rolling Averages",
+                    xaxis_title="Date",
+                    yaxis_title="Weight (lb)",
+                    hovermode="x unified",
+                    template="plotly_white",
+                    yaxis=dict(range=[y0, y1]),
+                )
+
+                # Inline range summary with reset hint (Plotly has a reset in modebar)
+                st.caption(f"Showing: {start_d:%b %d, %Y} – {end_d:%b %d, %Y}")
+                st.plotly_chart(fig, use_container_width=True)
+    with chart_col2:
+        # Weekly chart controls
+        st.markdown("#### Weekly Range")
+        if "weekly_range_mode" not in st.session_state:
+            st.session_state.weekly_range_mode = "All"
+        if "weekly_custom_start" not in st.session_state:
+            st.session_state.weekly_custom_start = None
+        if "weekly_custom_end" not in st.session_state:
+            st.session_state.weekly_custom_end = None
+        modes_w = ["1W", "1M", "3M", "6M", "1Y", "YTD", "All", "Custom"]
+        st.session_state.weekly_range_mode = st.radio(
+            "Weekly date range", options=modes_w, index=modes_w.index(st.session_state.weekly_range_mode), horizontal=True, key="weekly_range_mode_radio"
+        )
+        if st.session_state.weekly_range_mode == "Custom":
+            csa, cea = st.columns(2)
+            with csa:
+                st.session_state.weekly_custom_start = st.date_input("Start (weekly)", value=st.session_state.weekly_custom_start)
+            with cea:
+                st.session_state.weekly_custom_end = st.date_input("End (weekly)", value=st.session_state.weekly_custom_end)
+
+        w_start_d, w_end_d, w_err = _compute_date_range(st.session_state.df, st.session_state.weekly_range_mode, st.session_state.weekly_custom_start, st.session_state.weekly_custom_end)
+        if w_err:
+            st.error(w_err)
+        else:
+            weekly = compute_weekly_metrics(st.session_state.df, week_start=week_start)
+            wdf = weekly.get("weekly_changes_df")
+            if wdf is None or wdf.empty:
+                st.warning("No weekly data.")
+            else:
+                # Filter to selected weekly range by WeekEnd date
+                wmask = (wdf["WeekEnd"].dt.date >= w_start_d) & (wdf["WeekEnd"].dt.date <= w_end_d)
+                wdf_vis = wdf.loc[wmask]
+                if wdf_vis.empty:
+                    st.warning("No data in selected weekly range")
+                else:
+                    # Y-axis mode: Auto or Manual
+                    st.session_state.setdefault("weekly_y_mode", "Auto")
+                    st.session_state.setdefault("weekly_y_min", -5.0)
+                    st.session_state.setdefault("weekly_y_max", 5.0)
+                    st.session_state.weekly_y_mode = st.radio("Y-axis mode", ["Auto", "Manual"], index=0 if st.session_state.weekly_y_mode == "Auto" else 1, horizontal=True, key="weekly_y_mode_radio")
+                    y0, y1 = None, None
+                    if st.session_state.weekly_y_mode == "Manual":
+                        cmin, cmax = st.columns(2)
+                        with cmin:
+                            st.session_state.weekly_y_min = st.number_input("Y min (weekly)", value=float(st.session_state.weekly_y_min))
+                        with cmax:
+                            st.session_state.weekly_y_max = st.number_input("Y max (weekly)", value=float(st.session_state.weekly_y_max))
+                        y0, y1 = float(st.session_state.weekly_y_min), float(st.session_state.weekly_y_max)
+                        if st.button("Reset to Auto (weekly)"):
+                            st.session_state.weekly_y_mode = "Auto"
+                            st.rerun()
+                    else:
+                        # Autoscale from visible bars
+                        y_vals = wdf_vis["WeeklyChange"].to_numpy(dtype=float)
+                        ymin = float(np.nanmin(y_vals))
+                        ymax = float(np.nanmax(y_vals))
+                        rng = ymax - ymin
+                        pad = max(1.0, 0.05 * rng)
+                        y0, y1 = ymin - pad, ymax + pad
+
+                    fig_w = make_weekly_change_chart(wdf_vis)
+                    fig_w.update_layout(yaxis=dict(range=[y0, y1]))
+                    st.plotly_chart(fig_w, use_container_width=True)
+ 
+    # Table view (read-only; edits done via controls above for clarity/persistence)
+    st.dataframe(st.session_state.df, use_container_width=True, hide_index=True)
+
+
+# -------------------------------
+# Lightweight tests (doctests)
+# -------------------------------
+
+def _run_doctests_if_requested():
+    import os as _os
+    if _os.environ.get("RUN_DOCTESTS", "0") == "1":
+        import doctest as _doctest
+        _doctest.testmod(verbose=True)
+
+
+if __name__ == "__main__":
+    _run_doctests_if_requested()
+    # Streamlit apps are started via: streamlit run app.py
+    # Running this file directly won't start the UI, but doctests may run.
+    pass
+
+# Call the Streamlit app entrypoint when the script is executed by Streamlit
+main() 
