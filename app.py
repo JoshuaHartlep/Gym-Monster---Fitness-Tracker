@@ -1201,7 +1201,6 @@ def main():
 
     with left:
         st.subheader("Data & Controls")
-        st.caption("Your weight trends, explained.")
 
         # File import
         st.markdown("""Use the file uploader to import your CSV (Date,Weight). If omitted, the app will look for ./weights.csv or use a small sample.""")
