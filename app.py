@@ -985,7 +985,7 @@ def _render_chat_panel():
     # Env guard
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
-        st.info("Set OPENAI_API_KEY in your environment to enable Ask Gym Monster.")
+        st.info("Still under devlopement, no OPENAI API key yet.")
         return
 
     st.session_state.setdefault("chat_history", [])  # list of {role, content}
@@ -1200,7 +1200,7 @@ def main():
     left, right = st.columns([1, 1])
 
     with left:
-        st.subheader("Gym Monster • Data & Controls")
+        st.subheader("Data & Controls")
         st.caption("Your weight trends, explained.")
 
         # File import
@@ -1262,7 +1262,7 @@ def main():
         st.session_state["chat_goal_weight"] = target_weight
 
         st.divider()
-        st.markdown("### Add or Update Entry (Gym Monster)")
+        st.markdown("### Add or Update Entry")
         entry_date = st.date_input("Date", value=date.today())
         entry_weight = st.number_input("Weight (lb)", value=float(current_weight) if current_weight is not None else 180.0, step=0.1, format="%.1f")
         overwrite_needed = (st.session_state.df["Date"] == entry_date).any()
@@ -1279,7 +1279,7 @@ def main():
                 save_data(st.session_state.df)
                 st.success("Entry saved.")
 
-        st.markdown("### Edit / Delete Existing (Gym Monster)")
+        st.markdown("### Edit / Delete Existing")
         if not st.session_state.df.empty:
             dates = list(st.session_state.df["Date"].astype(str))
             selection = st.selectbox("Select date", options=dates, index=len(dates) - 1)
@@ -1309,7 +1309,7 @@ def main():
         st.download_button("Export CSV", data=csv_bytes, file_name="weights_export.csv", mime="text/csv", use_container_width=True)
 
     with right:
-        st.subheader("Gym Monster • Insights")
+        st.subheader("Insights")
         df = st.session_state.df
 
 
@@ -1478,7 +1478,7 @@ def main():
     st.divider()
 
     # Main area: charts and table
-    st.subheader("Gym Monster • Charts & Table")
+    st.subheader("Charts & Table")
 
     # Charts
     chart_col1, chart_col2 = st.columns(2)
