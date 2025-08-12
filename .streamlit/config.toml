@@ -1,0 +1,11 @@
+[client]
+toolbarMode = "viewer"
+showErrorDetails = true
+
+[server]
+enableXsrfProtection = true
+headless = true
+
+[theme]
+base = "dark"
+primaryColor = "#2E7CF6"
