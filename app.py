@@ -1204,6 +1204,19 @@ def main():
 
         # File import
         st.markdown("""Use the file uploader to import your CSV (Date,Weight). If omitted, the app will look for ./weights.csv or use a small sample.""")
+        
+        # Download link for example data
+        if os.path.exists(os.path.join(os.path.dirname(__file__), "example_weight_data.csv")):
+            with open(os.path.join(os.path.dirname(__file__), "example_weight_data.csv"), "rb") as f:
+                csv_data = f.read()
+            st.download_button(
+                label="📥 Download larger example data set",
+                data=csv_data,
+                file_name="example_weight_data.csv",
+                mime="text/csv",
+                help="Download a larger example dataset to try out the app features"
+            )
+        
         uploaded = st.file_uploader("Import CSV", type=["csv"], accept_multiple_files=False)
 
         # Load initial data (persisted > uploader > default path > sample)
