@@ -35,6 +35,9 @@ from dateutil import parser as dateparser
 import html
 import hashlib
 
+# Supabase imports
+from supabase import create_client, Client
+
 # SciPy is optional for robust Theil–Sen. Fall back to simple OLS if unavailable.
 try:
     from scipy.stats import theilslopes
@@ -53,6 +56,16 @@ import streamlit.components.v1 as components
 PERSIST_PATH = os.path.join(os.path.dirname(__file__), "weights.json")
 DEFAULT_CSV_PATH = os.path.join(os.path.dirname(__file__), "weights.csv")
 LOCAL_TZ = pytz.timezone("America/Chicago")
+
+# Initialize Supabase client
+try:
+    url = st.secrets["SUPABASE_URL"]
+    key = st.secrets["SUPABASE_ANON_KEY"]
+    supabase: Client = create_client(url, key)
+    SUPABASE_AVAILABLE = True
+except Exception:
+    supabase = None
+    SUPABASE_AVAILABLE = False
 
 SAMPLE_CSV = """Date,Weight
 2025-01-01,200.0
@@ -639,6 +652,188 @@ def _confidence_badges(df: pd.DataFrame, weekly_notes: List[str], trend_28_count
 
 
 # -------------------------------
+# Authentication and data persistence functions
+# -------------------------------
+
+def render_auth_ui():
+    """Render authentication UI with login/signup/guest options."""
+    if "user" not in st.session_state:
+        st.session_state.user = None
+    
+    if st.session_state.user is None:
+        st.markdown("### Welcome to Gym Monster")
+        st.markdown("Choose how you'd like to use the app:")
+        
+        tab1, tab2, tab3 = st.tabs(["Login", "Sign Up", "Continue as Guest"])
+        
+        with tab1:
+            st.markdown("#### Login to Your Account")
+            login_email = st.text_input("Email", key="login_email")
+            login_password = st.text_input("Password", type="password", key="login_password")
+            
+            if st.button("Login", key="login_btn"):
+                if login_email and login_password:
+                    try:
+                        response = supabase.auth.sign_in_with_password({
+                            "email": login_email,
+                            "password": login_password
+                        })
+                        st.session_state.user = {
+                            "id": response.user.id,
+                            "email": response.user.email
+                        }
+                        st.success("Login successful!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Login failed: {str(e)}")
+                else:
+                    st.error("Please enter both email and password.")
+        
+        with tab2:
+            st.markdown("#### Create New Account")
+            signup_email = st.text_input("Email", key="signup_email")
+            signup_password = st.text_input("Password", type="password", key="signup_password")
+            signup_confirm = st.text_input("Confirm Password", type="password", key="signup_confirm")
+            
+            if st.button("Sign Up", key="signup_btn"):
+                if signup_email and signup_password and signup_confirm:
+                    if signup_password != signup_confirm:
+                        st.error("Passwords don't match.")
+                    else:
+                        try:
+                            response = supabase.auth.sign_up({
+                                "email": signup_email,
+                                "password": signup_password
+                            })
+                            st.session_state.user = {
+                                "id": response.user.id,
+                                "email": response.user.email
+                            }
+                            st.success("Account created successfully!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Sign up failed: {str(e)}")
+                else:
+                    st.error("Please fill in all fields.")
+        
+        with tab3:
+            st.markdown("#### Continue as Guest")
+            st.info("Guest mode uses local storage. Your data will not be saved between sessions.")
+            if st.button("Continue as Guest", key="guest_btn"):
+                st.session_state.user = {"id": "guest", "email": "guest@example.com"}
+                st.success("Welcome! You're now in guest mode.")
+                st.rerun()
+    
+    else:
+        # User is logged in
+        user_email = st.session_state.user.get("email", "Unknown")
+        st.markdown(f"### Welcome, {user_email}")
+        
+        if st.button("Logout", key="logout_btn"):
+            if st.session_state.user.get("id") != "guest":
+                try:
+                    supabase.auth.sign_out()
+                except Exception:
+                    pass  # Ignore logout errors
+            st.session_state.user = None
+            st.success("Logged out successfully!")
+            st.rerun()
+
+
+def load_data_persistent(user_id: str) -> pd.DataFrame:
+    """Load data based on user authentication status."""
+    if user_id == "guest":
+        df = load_persisted()
+        if df is None or df.empty:
+            return pd.DataFrame(columns=["Date", "Weight"])
+        return df
+    else:
+        try:
+            response = supabase.table("weight_logs").select("*").eq("user_id", user_id).execute()
+            df = pd.DataFrame(response.data)
+            if not df.empty:
+                df["date"] = pd.to_datetime(df["date"])
+                df = df.sort_values("date")
+                # Rename columns to match expected format
+                df = df.rename(columns={"date": "Date", "weight": "Weight"})
+                df["Date"] = df["Date"].dt.date
+            else:
+                df = pd.DataFrame(columns=["Date", "Weight"])
+            return df
+        except Exception as e:
+            st.error(f"Failed to load data from database: {str(e)}")
+            return pd.DataFrame(columns=["Date", "Weight"])
+
+
+def upsert_entry_persistent(user_id: str, entry_date: date, weight_lbs: float) -> bool:
+    """Add or update an entry based on user authentication status."""
+    if user_id == "guest":
+        # Use existing local logic
+        df = load_persisted()
+        if df is None:
+            df = pd.DataFrame(columns=["Date", "Weight"])
+        df = add_or_update_entry(df, entry_date, weight_lbs)
+        save_data(df)
+        return True
+    else:
+        try:
+            supabase.table("weight_logs").upsert({
+                "user_id": user_id,
+                "date": str(entry_date),
+                "weight": float(weight_lbs)
+            }).execute()
+            return True
+        except Exception as e:
+            st.error(f"Failed to save entry: {str(e)}")
+            return False
+
+
+def delete_entry_persistent(user_id: str, entry_date: date) -> bool:
+    """Delete an entry based on user authentication status."""
+    if user_id == "guest":
+        # Use existing local logic
+        df = load_persisted()
+        if df is None:
+            df = pd.DataFrame(columns=["Date", "Weight"])
+        df = delete_entry(df, entry_date)
+        save_data(df)
+        return True
+    else:
+        try:
+            supabase.table("weight_logs").delete().eq("user_id", user_id).eq("date", str(entry_date)).execute()
+            return True
+        except Exception as e:
+            st.error(f"Failed to delete entry: {str(e)}")
+            return False
+
+
+def import_csv_persistent(user_id: str, csv_data: str) -> bool:
+    """Import CSV data based on user authentication status."""
+    try:
+        df = pd.read_csv(StringIO(csv_data))
+        df, stats = _clean_inplace(df)
+        
+        if user_id == "guest":
+            # Use existing local logic
+            save_data(df)
+            return True
+        else:
+            # Import to Supabase
+            for _, row in df.iterrows():
+                upsert_entry_persistent(user_id, row["Date"], row["Weight"])
+            return True
+    except Exception as e:
+        st.error(f"Failed to import CSV: {str(e)}")
+        return False
+
+
+def export_csv_persistent(user_id: str) -> str:
+    """Export CSV data based on user authentication status."""
+    df = load_data_persistent(user_id)
+    return df.to_csv(index=False) if not df.empty else "Date,Weight\n"
+
+
+# -------------------------------
 # Visualization helpers
 # -------------------------------
 
@@ -1083,6 +1278,19 @@ def main():
     st.title("Gym Monster")
     st.caption("Your weight trends, explained.")
     
+    # Check if Supabase is available
+    if not SUPABASE_AVAILABLE:
+        st.warning("⚠️ Supabase not configured. Running in guest mode only.")
+        if "user" not in st.session_state:
+            st.session_state.user = {"id": "guest", "email": "guest@example.com"}
+    
+    # Render authentication UI
+    render_auth_ui()
+    
+    # If user is not authenticated, stop here
+    if st.session_state.get("user") is None:
+        return
+    
     # State tracer for debugging (commented out - functionality confirmed)
     # st.session_state.setdefault("_run_id", 0)
     # st.session_state.setdefault("_last_commit", None)
@@ -1219,23 +1427,26 @@ def main():
         
         uploaded = st.file_uploader("Import CSV", type=["csv"], accept_multiple_files=False)
 
-        # Load initial data (persisted > uploader > default path > sample)
-        initial_csv_path = None
+        # Load initial data based on user authentication
+        user_id = st.session_state.user["id"]
+        
         if uploaded is not None:
             try:
-                tmp_df = pd.read_csv(uploaded)
-                tmp_df, stats = _clean_inplace(tmp_df)
-                # Adopt uploaded dataset
-                df = tmp_df
-                st.success(f"Gym Monster imported {len(df):,} rows. Dropped {stats['dropped_nulls']:,} nulls, deduped {stats['deduped']:,}.")
-                # Persist immediately
-                save_data(df)
+                # Read uploaded CSV
+                csv_content = uploaded.read().decode('utf-8')
+                if import_csv_persistent(user_id, csv_content):
+                    st.success(f"CSV imported successfully!")
+                    # Reload data after import
+                    df = load_data_persistent(user_id)
+                else:
+                    st.error("Failed to import CSV")
+                    df = load_data_persistent(user_id)
             except Exception as e:
                 st.error(f"Failed to read CSV: {e}")
-                df = _load_initial_data(None)
+                df = load_data_persistent(user_id)
         else:
-            # Load from persisted store or defaults
-            df = _load_initial_data(initial_csv_path)
+            # Load from persistent storage
+            df = load_data_persistent(user_id)
 
         # Make df editable via our controls; persist changes
         if "df" not in st.session_state:
@@ -1287,9 +1498,11 @@ def main():
             if overwrite_needed and not confirm_overwrite:
                 st.warning("Please confirm overwrite or change the date.")
             else:
-                st.session_state.df = add_or_update_entry(st.session_state.df, entry_date, entry_weight)
-                save_data(st.session_state.df)
-                st.success("Entry saved.")
+                if upsert_entry_persistent(user_id, entry_date, entry_weight):
+                    st.session_state.df = load_data_persistent(user_id)
+                    st.success("Entry saved.")
+                else:
+                    st.error("Failed to save entry.")
 
         st.markdown("### Edit / Delete Existing")
         if not st.session_state.df.empty:
@@ -1302,22 +1515,27 @@ def main():
                 cols = st.columns(2)
                 with cols[0]:
                     if st.button("Save edit", use_container_width=True):
-                        st.session_state.df = add_or_update_entry(st.session_state.df, sel_date, new_weight)
-                        save_data(st.session_state.df)
-                        st.success("Saved.")
+                        if upsert_entry_persistent(user_id, sel_date, new_weight):
+                            st.session_state.df = load_data_persistent(user_id)
+                            st.success("Saved.")
+                        else:
+                            st.error("Failed to save.")
                 with cols[1]:
                     confirm_delete = st.checkbox("Confirm delete", value=False, key="confirm_delete")
                     if st.button("Delete", use_container_width=True):
                         if not confirm_delete:
                             st.warning("Please check 'Confirm delete' before deleting.")
                         else:
-                            st.session_state.df = delete_entry(st.session_state.df, sel_date)
-                            save_data(st.session_state.df)
-                            st.success("Deleted.")
+                            if delete_entry_persistent(user_id, sel_date):
+                                st.session_state.df = load_data_persistent(user_id)
+                                st.success("Deleted.")
+                            else:
+                                st.error("Failed to delete.")
 
         st.divider()
         # Export current dataset
-        csv_bytes = st.session_state.df.to_csv(index=False).encode("utf-8") if not st.session_state.df.empty else b"Date,Weight\n"
+        csv_data = export_csv_persistent(user_id)
+        csv_bytes = csv_data.encode("utf-8")
         st.download_button("Export CSV", data=csv_bytes, file_name="weights_export.csv", mime="text/csv", use_container_width=True)
 
     with right:
