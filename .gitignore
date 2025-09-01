@@ -21,3 +21,5 @@ Thumbs.db
 
 # App-specific data
 weights.json
+
+.streamlit/secrets.toml
