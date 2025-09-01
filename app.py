@@ -63,9 +63,11 @@ try:
     key = st.secrets["SUPABASE_ANON_KEY"]
     supabase: Client = create_client(url, key)
     SUPABASE_AVAILABLE = True
-except Exception:
+except Exception as e:
     supabase = None
     SUPABASE_AVAILABLE = False
+    # Debug: Print the error for troubleshooting
+    print(f"Supabase initialization failed: {e}")
 
 SAMPLE_CSV = """Date,Weight
 2025-01-01,200.0
@@ -818,9 +820,18 @@ def import_csv_persistent(user_id: str, csv_data: str) -> bool:
             save_data(df)
             return True
         else:
-            # Import to Supabase
-            for _, row in df.iterrows():
-                upsert_entry_persistent(user_id, row["Date"], row["Weight"])
+            # Bulk upsert to Supabase using unique constraint (user_id, date)
+            records = [
+                {"user_id": user_id, "date": str(row["Date"]), "weight": float(row["Weight"])}
+                for _, row in df.iterrows()
+            ]
+            
+            # Bulk upsert using unique constraint (user_id, date)
+            supabase.table("weight_logs").upsert(
+                records,
+                on_conflict=["user_id", "date"]
+            ).execute()
+            
             return True
     except Exception as e:
         st.error(f"Failed to import CSV: {str(e)}")
@@ -1431,18 +1442,29 @@ def main():
         user_id = st.session_state.user["id"]
         
         if uploaded is not None:
-            try:
-                # Read uploaded CSV
-                csv_content = uploaded.read().decode('utf-8')
-                if import_csv_persistent(user_id, csv_content):
-                    st.success(f"CSV imported successfully!")
-                    # Reload data after import
+            if "importing" not in st.session_state:
+                st.session_state["importing"] = False
+
+            if not st.session_state["importing"]:
+                st.session_state["importing"] = True
+                try:
+                    # Read uploaded CSV
+                    csv_content = uploaded.read().decode('utf-8')
+                    if import_csv_persistent(user_id, csv_content):
+                        st.success("✅ CSV imported successfully!")
+                        # Reload data after import
+                        df = load_data_persistent(user_id)
+                    else:
+                        st.error("❌ Failed to import CSV")
+                        df = load_data_persistent(user_id)
+                except Exception as e:
+                    st.error(f"❌ Failed to read CSV: {e}")
                     df = load_data_persistent(user_id)
-                else:
-                    st.error("Failed to import CSV")
-                    df = load_data_persistent(user_id)
-            except Exception as e:
-                st.error(f"Failed to read CSV: {e}")
+                finally:
+                    st.session_state["importing"] = False
+            else:
+                # Still importing, show loading state
+                st.info("🔄 Importing CSV...")
                 df = load_data_persistent(user_id)
         else:
             # Load from persistent storage
