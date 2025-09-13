@@ -69,6 +69,19 @@ except Exception as e:
     # Debug: Print the error for troubleshooting
     print(f"Supabase initialization failed: {e}")
 
+
+def test_supabase_schema():
+    """Test Supabase connection."""
+    if not SUPABASE_AVAILABLE:
+        return False
+    
+    try:
+        # Try to get table info
+        response = supabase.table("weight_logs").select("*").limit(1).execute()
+        return True
+    except Exception as e:
+        return False
+
 SAMPLE_CSV = """Date,Weight
 2025-01-01,200.0
 2025-01-03,199.2
@@ -661,9 +674,55 @@ def render_auth_ui():
     """Render authentication UI with login/signup/guest options."""
     if "user" not in st.session_state:
         st.session_state.user = None
+    if "session" not in st.session_state:
+        st.session_state.session = None
+    
+    # Handle OAuth callback
+    if SUPABASE_AVAILABLE:
+        query_params = st.query_params
+        if "code" in query_params:
+            code = query_params["code"]
+            try:
+                res = supabase.auth.exchange_code_for_session({"auth_code": code})
+                if res.user:
+                    st.session_state.user = res.user
+                    st.session_state.session = res.session
+                    st.success(f"✅ Logged in as {res.user.email}")
+                    st.rerun()
+            except Exception as e:
+                error_msg = str(e)
+                if "provider is not enabled" in error_msg:
+                    st.error("❌ Google OAuth is not enabled in Supabase. Please enable it in Authentication → Providers.")
+                    st.info("💡 Check the 'Google Login Setup Help' section in the sidebar for detailed instructions.")
+                else:
+                    st.error(f"OAuth login failed: {error_msg}")
+    
+    # Persist session across reruns
+    if "session" in st.session_state and st.session_state.session and SUPABASE_AVAILABLE:
+        try:
+            supabase.auth.set_session(st.session_state.session.access_token, st.session_state.session.refresh_token)
+        except Exception:
+            pass  # Ignore session errors
     
     if st.session_state.user is None:
         st.markdown("### Welcome to Gym Monster")
+        st.markdown("**A comprehensive fitness tracking application with AI-powered insights**")
+        
+        # Prominent Demo Button for Recruiters
+        st.markdown("---")
+        st.markdown("### 🎯 For Recruiters & Demo")
+        st.markdown("**Try the full application with sample data - no signup required!**")
+        
+        # Large, prominent demo button
+        demo_col1, demo_col2, demo_col3 = st.columns([1, 2, 1])
+        with demo_col2:
+            if st.button("🚀 **DEMO THIS PROGRAM**", key="demo_btn", use_container_width=True, type="primary"):
+                st.session_state.user = {"id": "guest", "email": "demo@example.com"}
+                st.success("🎉 Welcome to the demo! You can now explore all features with sample data.")
+                st.rerun()
+        
+        st.markdown("---")
+        st.markdown("### User Authentication")
         st.markdown("Choose how you'd like to use the app:")
         
         tab1, tab2, tab3 = st.tabs(["Login", "Sign Up", "Continue as Guest"])
@@ -684,6 +743,7 @@ def render_auth_ui():
                             "id": response.user.id,
                             "email": response.user.email
                         }
+                        st.session_state.session = response.session
                         st.success("Login successful!")
                         st.rerun()
                     except Exception as e:
@@ -711,6 +771,7 @@ def render_auth_ui():
                                 "id": response.user.id,
                                 "email": response.user.email
                             }
+                            st.session_state.session = response.session
                             st.success("Account created successfully!")
                             st.rerun()
                         except Exception as e:
@@ -727,24 +788,15 @@ def render_auth_ui():
                 st.rerun()
     
     else:
-        # User is logged in
+        # User is logged in - show welcome message
         user_email = st.session_state.user.get("email", "Unknown")
         st.markdown(f"### Welcome, {user_email}")
-        
-        if st.button("Logout", key="logout_btn"):
-            if st.session_state.user.get("id") != "guest":
-                try:
-                    supabase.auth.sign_out()
-                except Exception:
-                    pass  # Ignore logout errors
-            st.session_state.user = None
-            st.success("Logged out successfully!")
-            st.rerun()
+        st.info("You can manage your account from the sidebar.")
 
 
 def load_data_persistent(user_id: str) -> pd.DataFrame:
     """Load data based on user authentication status."""
-    if user_id == "guest":
+    if user_id in ["guest", "demo@example.com"]:
         df = load_persisted()
         if df is None or df.empty:
             return pd.DataFrame(columns=["Date", "Weight"])
@@ -769,7 +821,8 @@ def load_data_persistent(user_id: str) -> pd.DataFrame:
 
 def upsert_entry_persistent(user_id: str, entry_date: date, weight_lbs: float) -> bool:
     """Add or update an entry based on user authentication status."""
-    if user_id == "guest":
+    # Handle guest users (local storage only)
+    if user_id in ["guest", "demo@example.com"]:
         # Use existing local logic
         df = load_persisted()
         if df is None:
@@ -778,21 +831,27 @@ def upsert_entry_persistent(user_id: str, entry_date: date, weight_lbs: float) -
         save_data(df)
         return True
     else:
+        # Handle authenticated users (Supabase) - using delete-then-insert method
         try:
-            supabase.table("weight_logs").upsert({
+            # Delete any existing entry for this user/date
+            supabase.table("weight_logs").delete().eq("user_id", user_id).eq("date", str(entry_date)).execute()
+            
+            # Insert new entry
+            response = supabase.table("weight_logs").insert({
                 "user_id": user_id,
                 "date": str(entry_date),
                 "weight": float(weight_lbs)
             }).execute()
+            
             return True
         except Exception as e:
-            st.error(f"Failed to save entry: {str(e)}")
+            st.error(f"❌ Failed to save entry: {str(e)}")
             return False
 
 
 def delete_entry_persistent(user_id: str, entry_date: date) -> bool:
     """Delete an entry based on user authentication status."""
-    if user_id == "guest":
+    if user_id in ["guest", "demo@example.com"]:
         # Use existing local logic
         df = load_persisted()
         if df is None:
@@ -815,7 +874,7 @@ def import_csv_persistent(user_id: str, csv_data: str) -> bool:
         df = pd.read_csv(StringIO(csv_data))
         df, stats = _clean_inplace(df)
         
-        if user_id == "guest":
+        if user_id in ["guest", "demo@example.com"]:
             # Use existing local logic
             save_data(df)
             return True
@@ -826,11 +885,11 @@ def import_csv_persistent(user_id: str, csv_data: str) -> bool:
                 for _, row in df.iterrows()
             ]
             
-            # Bulk upsert using unique constraint (user_id, date)
-            supabase.table("weight_logs").upsert(
-                records,
-                on_conflict=["user_id", "date"]
-            ).execute()
+            # Delete all existing records for this user, then insert all new ones
+            supabase.table("weight_logs").delete().eq("user_id", user_id).execute()
+            
+            # Insert all records
+            response = supabase.table("weight_logs").insert(records).execute()
             
             return True
     except Exception as e:
@@ -1294,6 +1353,76 @@ def main():
         st.warning("⚠️ Supabase not configured. Running in guest mode only.")
         if "user" not in st.session_state:
             st.session_state.user = {"id": "guest", "email": "guest@example.com"}
+    else:
+        # Test Supabase connection
+        test_supabase_schema()
+    
+    # Add sidebar with Google login option
+    with st.sidebar:
+        st.markdown("### 🔐 Authentication")
+        
+        # Show current user status
+        if st.session_state.get("user"):
+            user_email = st.session_state.user.get("email", "Unknown")
+            st.success(f"✅ Logged in as {user_email}")
+            
+            if st.button("🚪 Logout", use_container_width=True):
+                if st.session_state.user.get("id") not in ["guest", "demo@example.com"]:
+                    try:
+                        supabase.auth.sign_out()
+                    except Exception:
+                        pass  # Ignore logout errors
+                st.session_state.user = None
+                st.session_state.session = None
+                st.success("Logged out successfully!")
+                st.rerun()
+        else:
+            st.info("Not logged in")
+            
+            # Google OAuth Login Button in sidebar
+            if SUPABASE_AVAILABLE:
+                # Determine redirect URL based on environment
+                # Check if we're running locally (Streamlit default port is 8501)
+                try:
+                    # Try to get the current URL from Streamlit
+                    current_url = st.get_option("server.headless")
+                    if current_url or "localhost" in str(st.get_option("server.port")):
+                        redirect_url = "http://localhost:8501"
+                    else:
+                        redirect_url = "https://gym-monster.streamlit.app"  # Update with your deployed URL
+                except:
+                    # Fallback: assume local development
+                    redirect_url = "http://localhost:8501"
+                
+                auth_url = f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?provider=google&redirect_to={redirect_url}"
+                st.markdown(f"[🔑 **Login with Google**]({auth_url})", unsafe_allow_html=True)
+                st.markdown("---")
+                
+                # Show current redirect URL for debugging
+                st.caption(f"Redirect URL: `{redirect_url}`")
+                
+                # Add setup instructions if Google provider might not be configured
+                with st.expander("🔧 Google Login Setup Help"):
+                    st.markdown(f"""
+                    **If you see "provider is not enabled" error:**
+                    
+                    1. Go to your Supabase dashboard
+                    2. Navigate to **Authentication** → **Providers**
+                    3. Enable the **Google** provider
+                    4. Add your Google OAuth credentials (Client ID & Secret)
+                    5. Set the redirect URL to: `{redirect_url}`
+                    
+                    **If you see "refused to connect" error:**
+                    
+                    1. Check that your Supabase redirect URL is set to: `{redirect_url}`
+                    2. Check that your Google Cloud Console has: `{redirect_url}`
+                    3. Make sure you're running Streamlit on port 8501
+                    
+                    **Need Google OAuth credentials?**
+                    - Go to [Google Cloud Console](https://console.cloud.google.com/)
+                    - Create OAuth 2.0 credentials
+                    - Add redirect URI: `{redirect_url}`
+                    """)
     
     # Render authentication UI
     render_auth_ui()
@@ -1510,21 +1639,22 @@ def main():
         st.markdown("### Add or Update Entry")
         entry_date = st.date_input("Date", value=date.today())
         entry_weight = st.number_input("Weight (lb)", value=float(current_weight) if current_weight is not None else 180.0, step=0.1, format="%.1f")
-        overwrite_needed = (st.session_state.df["Date"] == entry_date).any()
-        if overwrite_needed:
-            st.info("An entry for this date exists.")
-            confirm_overwrite = st.checkbox("Confirm overwrite existing entry", value=False, key="confirm_overwrite")
-        else:
-            confirm_overwrite = True
+        
+        # Check if entry exists for this date
+        entry_exists = (st.session_state.df["Date"] == entry_date).any()
+        if entry_exists:
+            existing_weight = float(st.session_state.df.loc[st.session_state.df["Date"] == entry_date, "Weight"].iloc[0])
+            st.info(f"📝 Entry exists for {entry_date}: {existing_weight:.1f} lb. Click 'Add / Update' to overwrite.")
+        
         if st.button("Add / Update", use_container_width=True):
-            if overwrite_needed and not confirm_overwrite:
-                st.warning("Please confirm overwrite or change the date.")
-            else:
-                if upsert_entry_persistent(user_id, entry_date, entry_weight):
-                    st.session_state.df = load_data_persistent(user_id)
-                    st.success("Entry saved.")
+            if upsert_entry_persistent(user_id, entry_date, entry_weight):
+                st.session_state.df = load_data_persistent(user_id)
+                if entry_exists:
+                    st.success(f"✅ Entry updated for {entry_date}: {entry_weight:.1f} lb")
                 else:
-                    st.error("Failed to save entry.")
+                    st.success(f"✅ New entry added for {entry_date}: {entry_weight:.1f} lb")
+            else:
+                st.error("❌ Failed to save entry.")
 
         st.markdown("### Edit / Delete Existing")
         if not st.session_state.df.empty:
@@ -1539,9 +1669,9 @@ def main():
                     if st.button("Save edit", use_container_width=True):
                         if upsert_entry_persistent(user_id, sel_date, new_weight):
                             st.session_state.df = load_data_persistent(user_id)
-                            st.success("Saved.")
+                            st.success(f"✅ Updated {sel_date}: {new_weight:.1f} lb")
                         else:
-                            st.error("Failed to save.")
+                            st.error("❌ Failed to save.")
                 with cols[1]:
                     confirm_delete = st.checkbox("Confirm delete", value=False, key="confirm_delete")
                     if st.button("Delete", use_container_width=True):
@@ -1550,9 +1680,9 @@ def main():
                         else:
                             if delete_entry_persistent(user_id, sel_date):
                                 st.session_state.df = load_data_persistent(user_id)
-                                st.success("Deleted.")
+                                st.success(f"✅ Deleted entry for {sel_date}")
                             else:
-                                st.error("Failed to delete.")
+                                st.error("❌ Failed to delete.")
 
         st.divider()
         # Export current dataset
