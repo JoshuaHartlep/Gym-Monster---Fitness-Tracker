@@ -77,9 +77,9 @@ if SUPABASE_AVAILABLE and "code" in st.query_params:
         if res.user:
             st.session_state.user = res.user
             st.session_state.session = res.session
-            st.sidebar.success(f"✅ Logged in as {res.user.email}")
+            st.success(f"✅ Logged in as {res.user.email}")
     except Exception as e:
-        st.sidebar.error(f"❌ Failed to exchange code: {e}")
+        st.error(f"❌ Failed to exchange code: {e}")
 
 # Persist session across reruns
 if SUPABASE_AVAILABLE and "session" in st.session_state and st.session_state.session:
@@ -704,8 +704,31 @@ def render_auth_ui():
         st.markdown("### Welcome to Gym Monster")
         st.markdown("**A comprehensive fitness tracking application with AI-powered insights**")
         
+        # Google OAuth Login Button - Prominent placement
+        if SUPABASE_AVAILABLE:
+            st.markdown("---")
+            st.markdown("### 🔑 Quick Login")
+            
+            # Determine redirect URL based on environment
+            try:
+                current_url = st.get_option("server.headless")
+                if current_url or "localhost" in str(st.get_option("server.port")):
+                    redirect_url = "http://localhost:8501"
+                else:
+                    redirect_url = "https://gym-monster.streamlit.app"
+            except:
+                redirect_url = "http://localhost:8501"
+            
+            auth_url = f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?provider=google&redirect_to={redirect_url}&flow_type=pkce"
+            
+            # Large, prominent Google login button
+            google_col1, google_col2, google_col3 = st.columns([1, 2, 1])
+            with google_col2:
+                st.markdown(f"[🔑 **Login with Google**]({auth_url})", unsafe_allow_html=True)
+            
+            st.markdown("---")
+        
         # Prominent Demo Button for Recruiters
-        st.markdown("---")
         st.markdown("### 🎯 For Recruiters & Demo")
         st.markdown("**Try the full application with sample data - no signup required!**")
         
@@ -719,10 +742,10 @@ def render_auth_ui():
                 st.rerun()
         
         st.markdown("---")
-        st.markdown("### User Authentication")
+        st.markdown("### Other Authentication Options")
         st.markdown("Choose how you'd like to use the app:")
         
-        tab1, tab2, tab3 = st.tabs(["Login", "Sign Up", "Continue as Guest"])
+        tab1, tab2, tab3 = st.tabs(["Email Login", "Sign Up", "Continue as Guest"])
         
         with tab1:
             st.markdown("#### Login to Your Account")
@@ -786,10 +809,25 @@ def render_auth_ui():
                 st.rerun()
     
     else:
-        # User is logged in - show welcome message
+        # User is logged in - show welcome message and logout option
         user_email = st.session_state.user.get("email", "Unknown")
-        st.markdown(f"### Welcome, {user_email}")
-        st.info("You can manage your account from the sidebar.")
+        
+        # Create a header with user info and logout button
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.markdown(f"### Welcome, {user_email}")
+        with col2:
+            if st.button("🚪 Logout", use_container_width=True):
+                if st.session_state.user.get("id") not in ["guest", "demo@example.com"]:
+                    try:
+                        supabase.auth.sign_out()
+                    except Exception:
+                        pass  # Ignore logout errors
+                st.session_state.clear()
+                st.success("Logged out successfully!")
+                st.rerun()
+        
+        st.markdown("---")
 
 
 def load_data_persistent(user_id: str) -> pd.DataFrame:
@@ -1355,71 +1393,6 @@ def main():
         # Test Supabase connection
         test_supabase_schema()
     
-    # Add sidebar with Google login option
-    with st.sidebar:
-        st.markdown("### 🔐 Authentication")
-        
-        # Show current user status
-        if st.session_state.get("user"):
-            user_email = st.session_state.user.get("email", "Unknown")
-            st.success(f"✅ Logged in as {user_email}")
-            
-            if st.button("🚪 Logout", use_container_width=True):
-                if st.session_state.user.get("id") not in ["guest", "demo@example.com"]:
-                    try:
-                        supabase.auth.sign_out()
-                    except Exception:
-                        pass  # Ignore logout errors
-                st.session_state.clear()
-                st.sidebar.info("Logged out")
-                st.rerun()
-        else:
-            st.info("Not logged in")
-            
-            # Google OAuth Login Button in sidebar
-            if SUPABASE_AVAILABLE:
-                # Determine redirect URL based on environment
-                # Check if we're running locally (Streamlit default port is 8501)
-                try:
-                    # Try to get the current URL from Streamlit
-                    current_url = st.get_option("server.headless")
-                    if current_url or "localhost" in str(st.get_option("server.port")):
-                        redirect_url = "http://localhost:8501"
-                    else:
-                        redirect_url = "https://gym-monster.streamlit.app"  # Update with your deployed URL
-                except:
-                    # Fallback: assume local development
-                    redirect_url = "http://localhost:8501"
-                
-                auth_url = f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?provider=google&redirect_to={redirect_url}&flow_type=pkce"
-                st.markdown(f"[🔑 **Login with Google**]({auth_url})", unsafe_allow_html=True)
-                st.markdown("---")
-                
-                # Show current redirect URL for debugging
-                st.caption(f"Redirect URL: `{redirect_url}`")
-                
-                # Add setup instructions if Google provider might not be configured
-                with st.expander("🔧 Google Login Setup Help"):
-                    st.markdown(f"""
-                    **If you see "provider is not enabled" error:**
-                    
-                    1. Go to your Supabase dashboard
-                    2. Navigate to **Authentication** → **Providers**
-                    3. Enable the **Google** provider
-                    4. Add your Google OAuth credentials (Client ID & Secret)
-                    5. Set the redirect URL to: `{redirect_url}`
-                    
-                    **If you see "refused to connect" error:**
-                    
-                    1. Check that your Supabase redirect URL is set to: `{redirect_url}`
-                    2. Check that your Google Cloud Console has: `{redirect_url}`
-                    3. Make sure you're running Streamlit on port 8501
-                    
-                    **Need Google OAuth credentials?**
-                    - Go to [Google Cloud Console](https://console.cloud.google.com/)
-                    - Create OAuth 2.0 credentials
-                    - Add redirect URI: `{redirect_url}`
-                    """)
     
     # Render authentication UI
     render_auth_ui()
