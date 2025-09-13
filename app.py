@@ -69,6 +69,28 @@ except Exception as e:
     # Debug: Print the error for troubleshooting
     print(f"Supabase initialization failed: {e}")
 
+# Handle OAuth callback at the top level
+if SUPABASE_AVAILABLE and "code" in st.query_params:
+    code = st.query_params["code"]
+    try:
+        res = supabase.auth.exchange_code_for_session({"auth_code": code})
+        if res.user:
+            st.session_state.user = res.user
+            st.session_state.session = res.session
+            st.sidebar.success(f"✅ Logged in as {res.user.email}")
+    except Exception as e:
+        st.sidebar.error(f"❌ Failed to exchange code: {e}")
+
+# Persist session across reruns
+if SUPABASE_AVAILABLE and "session" in st.session_state and st.session_state.session:
+    try:
+        supabase.auth.set_session(
+            st.session_state.session.access_token,
+            st.session_state.session.refresh_token
+        )
+    except Exception:
+        pass  # Ignore session errors
+
 
 def test_supabase_schema():
     """Test Supabase connection."""
@@ -677,32 +699,6 @@ def render_auth_ui():
     if "session" not in st.session_state:
         st.session_state.session = None
     
-    # Handle OAuth callback
-    if SUPABASE_AVAILABLE:
-        query_params = st.query_params
-        if "code" in query_params:
-            code = query_params["code"]
-            try:
-                res = supabase.auth.exchange_code_for_session({"auth_code": code})
-                if res.user:
-                    st.session_state.user = res.user
-                    st.session_state.session = res.session
-                    st.success(f"✅ Logged in as {res.user.email}")
-                    st.rerun()
-            except Exception as e:
-                error_msg = str(e)
-                if "provider is not enabled" in error_msg:
-                    st.error("❌ Google OAuth is not enabled in Supabase. Please enable it in Authentication → Providers.")
-                    st.info("💡 Check the 'Google Login Setup Help' section in the sidebar for detailed instructions.")
-                else:
-                    st.error(f"OAuth login failed: {error_msg}")
-    
-    # Persist session across reruns
-    if "session" in st.session_state and st.session_state.session and SUPABASE_AVAILABLE:
-        try:
-            supabase.auth.set_session(st.session_state.session.access_token, st.session_state.session.refresh_token)
-        except Exception:
-            pass  # Ignore session errors
     
     if st.session_state.user is None:
         st.markdown("### Welcome to Gym Monster")
@@ -718,6 +714,7 @@ def render_auth_ui():
         with demo_col2:
             if st.button("🚀 **DEMO THIS PROGRAM**", key="demo_btn", use_container_width=True, type="primary"):
                 st.session_state.user = {"id": "guest", "email": "demo@example.com"}
+                st.session_state.session = None  # No session for demo mode
                 st.success("🎉 Welcome to the demo! You can now explore all features with sample data.")
                 st.rerun()
         
@@ -784,6 +781,7 @@ def render_auth_ui():
             st.info("Guest mode uses local storage. Your data will not be saved between sessions.")
             if st.button("Continue as Guest", key="guest_btn"):
                 st.session_state.user = {"id": "guest", "email": "guest@example.com"}
+                st.session_state.session = None  # No session for guest mode
                 st.success("Welcome! You're now in guest mode.")
                 st.rerun()
     
@@ -1372,9 +1370,8 @@ def main():
                         supabase.auth.sign_out()
                     except Exception:
                         pass  # Ignore logout errors
-                st.session_state.user = None
-                st.session_state.session = None
-                st.success("Logged out successfully!")
+                st.session_state.clear()
+                st.sidebar.info("Logged out")
                 st.rerun()
         else:
             st.info("Not logged in")
@@ -1394,7 +1391,7 @@ def main():
                     # Fallback: assume local development
                     redirect_url = "http://localhost:8501"
                 
-                auth_url = f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?provider=google&redirect_to={redirect_url}"
+                auth_url = f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?provider=google&redirect_to={redirect_url}&flow_type=pkce"
                 st.markdown(f"[🔑 **Login with Google**]({auth_url})", unsafe_allow_html=True)
                 st.markdown("---")
                 
