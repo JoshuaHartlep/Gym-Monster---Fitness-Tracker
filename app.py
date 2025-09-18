@@ -55,6 +55,7 @@ import streamlit.components.v1 as components
 # -------------------------------
 PERSIST_PATH = os.path.join(os.path.dirname(__file__), "weights.json")
 DEFAULT_CSV_PATH = os.path.join(os.path.dirname(__file__), "weights.csv")
+GUEST_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "guest_default_dataset.csv")
 LOCAL_TZ = pytz.timezone("America/Chicago")
 
 # Initialize Supabase client
@@ -206,6 +207,24 @@ def load_persisted(path: str = PERSIST_PATH) -> Optional[pd.DataFrame]:
         return df
     except Exception:
         return None
+
+
+def load_guest_data() -> pd.DataFrame:
+    """
+    Load the default guest dataset for demo purposes.
+    
+    Returns a cleaned DataFrame with columns [Date (date), Weight (float)].
+    """
+    try:
+        df = pd.read_csv(GUEST_DATA_PATH)
+        df, _ = _clean_inplace(df)
+        return df
+    except Exception as e:
+        # Fallback to sample data if guest dataset fails to load
+        print(f"Failed to load guest data: {e}")
+        df = pd.read_csv(StringIO(SAMPLE_CSV))
+        df, _ = _clean_inplace(df)
+        return df
 
 
 def load_data(csv_path: Optional[str] = None, persisted_store: Optional[str] = PERSIST_PATH) -> pd.DataFrame:
@@ -726,6 +745,9 @@ def render_auth_ui():
             with google_col2:
                 st.markdown(f"[🔑 **Login with Google**]({auth_url})", unsafe_allow_html=True)
             
+            # Add construction message
+            st.info("🔨 Google Login is under construction. Please use email/password or Guest mode for now.")
+            
             st.markdown("---")
         
         # Prominent Demo Button for Recruiters
@@ -738,6 +760,8 @@ def render_auth_ui():
             if st.button("🚀 **DEMO THIS PROGRAM**", key="demo_btn", use_container_width=True, type="primary"):
                 st.session_state.user = {"id": "guest", "email": "demo@example.com"}
                 st.session_state.session = None  # No session for demo mode
+                # Load guest data immediately
+                st.session_state.df = load_guest_data()
                 st.success("🎉 Welcome to the demo! You can now explore all features with sample data.")
                 st.rerun()
         
@@ -805,7 +829,9 @@ def render_auth_ui():
             if st.button("Continue as Guest", key="guest_btn"):
                 st.session_state.user = {"id": "guest", "email": "guest@example.com"}
                 st.session_state.session = None  # No session for guest mode
-                st.success("Welcome! You're now in guest mode.")
+                # Load guest data immediately
+                st.session_state.df = load_guest_data()
+                st.success("Welcome! You're now in guest mode with demo data loaded.")
                 st.rerun()
     
     else:
@@ -833,10 +859,8 @@ def render_auth_ui():
 def load_data_persistent(user_id: str) -> pd.DataFrame:
     """Load data based on user authentication status."""
     if user_id in ["guest", "demo@example.com"]:
-        df = load_persisted()
-        if df is None or df.empty:
-            return pd.DataFrame(columns=["Date", "Weight"])
-        return df
+        # For guest users, load the default guest dataset
+        return load_guest_data()
     else:
         try:
             response = supabase.table("weight_logs").select("*").eq("user_id", user_id).execute()
