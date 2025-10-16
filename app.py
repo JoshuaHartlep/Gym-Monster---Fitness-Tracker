@@ -70,17 +70,86 @@ except Exception as e:
     # Debug: Print the error for troubleshooting
     print(f"Supabase initialization failed: {e}")
 
-# Handle OAuth callback at the top level
-if SUPABASE_AVAILABLE and "code" in st.query_params:
-    code = st.query_params["code"]
-    try:
-        res = supabase.auth.exchange_code_for_session({"auth_code": code})
-        if res.user:
-            st.session_state.user = res.user
-            st.session_state.session = res.session
-            st.success(f"✅ Logged in as {res.user.email}")
-    except Exception as e:
-        st.error(f"❌ Failed to exchange code: {e}")
+def extract_fragment_tokens():
+    """Extract OAuth tokens from URL fragment using JavaScript."""
+    if not SUPABASE_AVAILABLE:
+        return
+    
+    # JavaScript to extract tokens from URL fragment and redirect with query params
+    components.html(
+        """
+        <script>
+        // Check if there are OAuth tokens in the URL fragment
+        if (window.location.hash) {
+            const hash = window.location.hash.substring(1);
+            const params = new URLSearchParams(hash);
+            const accessToken = params.get('access_token');
+            const refreshToken = params.get('refresh_token');
+            
+            if (accessToken && refreshToken) {
+                // Redirect to same page with tokens in query params (which Streamlit can read)
+                const url = new URL(window.location.href.split('#')[0]);
+                url.searchParams.set('access_token', accessToken);
+                url.searchParams.set('refresh_token', refreshToken);
+                // Redirect without fragment
+                window.location.replace(url.toString());
+            }
+        }
+        </script>
+        """,
+        height=0,
+    )
+
+# Handle OAuth callback - supports both PKCE (code) and implicit (tokens) flows
+def handle_oauth_callback():
+    """Handle OAuth callback with either authorization code or direct tokens."""
+    if not SUPABASE_AVAILABLE:
+        return
+    
+    # Method 1: PKCE flow - Check for authorization code from OAuth redirect
+    if "code" in st.query_params:
+        code = st.query_params["code"]
+        try:
+            # Exchange authorization code for session
+            response = supabase.auth.exchange_code_for_session(code)
+            if response.user:
+                st.session_state.user = {
+                    "id": response.user.id,
+                    "email": response.user.email
+                }
+                st.session_state.session = response.session
+                
+                # Clear code from URL to prevent re-processing
+                st.query_params.clear()
+                st.success(f"✅ Logged in as {response.user.email}")
+                st.rerun()
+        except Exception as e:
+            st.error(f"❌ Authentication failed: {e}")
+            st.query_params.clear()
+            st.rerun()
+    
+    # Method 2: Implicit flow - Check for tokens (passed from fragment via JS)
+    elif "access_token" in st.query_params and "refresh_token" in st.query_params:
+        access_token = st.query_params["access_token"]
+        refresh_token = st.query_params["refresh_token"]
+        try:
+            # Set session with the tokens from OAuth redirect
+            response = supabase.auth.set_session(access_token, refresh_token)
+            if response.user:
+                st.session_state.user = {
+                    "id": response.user.id,
+                    "email": response.user.email
+                }
+                st.session_state.session = response.session
+                
+                # Clear tokens from URL to prevent re-processing
+                st.query_params.clear()
+                st.success(f"✅ Logged in as {response.user.email}")
+                st.rerun()
+        except Exception as e:
+            st.error(f"❌ Authentication failed: {e}")
+            st.query_params.clear()
+            st.rerun()
 
 # Persist session across reruns
 if SUPABASE_AVAILABLE and "session" in st.session_state and st.session_state.session:
@@ -738,6 +807,7 @@ def render_auth_ui():
             except:
                 redirect_url = "http://localhost:8501"
             
+            # Use PKCE flow for secure authorization code exchange
             auth_url = f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?provider=google&redirect_to={redirect_url}&flow_type=pkce"
             
             # Large, prominent Google login button
@@ -745,8 +815,8 @@ def render_auth_ui():
             with google_col2:
                 st.markdown(f"[🔑 **Login with Google**]({auth_url})", unsafe_allow_html=True)
             
-            # Add construction message
-            st.info("🔨 Google Login is under construction. Please use email/password or Guest mode for now.")
+            # Note about Google login
+            st.info("🔐 Sign in with your Google account for quick access and data persistence across devices.")
             
             st.markdown("---")
         
@@ -1405,6 +1475,13 @@ def _load_initial_data(csv_path: Optional[str]) -> pd.DataFrame:
 # Main UI
 def main():
     st.set_page_config(page_title="Gym Monster", layout="wide")
+    
+    # Extract tokens from URL fragment if present (for implicit flow)
+    extract_fragment_tokens()
+    
+    # Handle OAuth callback IMMEDIATELY after set_page_config
+    handle_oauth_callback()
+    
     st.title("Gym Monster")
     st.caption("Your weight trends, explained.")
     

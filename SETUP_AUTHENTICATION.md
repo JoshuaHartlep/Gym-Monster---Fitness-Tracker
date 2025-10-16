@@ -88,6 +88,25 @@ SUPABASE_ANON_KEY = "your-anon-key"
    - Enter your Google OAuth Client ID and Client Secret
    - Set the redirect URL to your deployed app URL
 
+### OAuth Flow Types
+
+The app supports both OAuth flow types:
+
+1. **PKCE Flow (Recommended - More Secure)**:
+   - Authorization code is returned in query params: `?code=...`
+   - Code is exchanged server-side for tokens
+   - Tokens never appear in browser URL
+   - To enable: Set `flow_type=pkce` in OAuth URL (already configured)
+   - **Note**: Supabase may default to implicit flow - check dashboard settings
+
+2. **Implicit Flow (Fallback - Less Secure)**:
+   - Tokens returned in URL fragment: `#access_token=...`
+   - JavaScript extracts tokens and passes to Streamlit
+   - Tokens briefly visible in browser URL
+   - Automatically detected if Supabase uses this flow
+
+**Current Implementation**: The app automatically handles both flows. If PKCE doesn't work (Supabase returns tokens in fragment), the app falls back to implicit flow with JavaScript extraction.
+
 ### Testing Google OAuth
 
 1. Run the app: `streamlit run app.py`
