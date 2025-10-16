@@ -71,7 +71,13 @@ except Exception as e:
     print(f"Supabase initialization failed: {e}")
 
 def extract_fragment_tokens():
-    """Extract OAuth tokens from URL fragment using JavaScript."""
+    """
+    Extract OAuth tokens from URL fragment using JavaScript.
+    
+    This component MUST run early in the page lifecycle, before any code
+    that reads st.query_params, because it moves tokens from the URL fragment
+    (#access_token=...) to query params (?access_token=...) that Streamlit can read.
+    """
     if not SUPABASE_AVAILABLE:
         return
     
@@ -100,55 +106,212 @@ def extract_fragment_tokens():
         height=0,
     )
 
+
+def _get_query_param_as_string(params_dict, key):
+    """
+    Safely extract a query parameter as a plain string.
+    
+    Streamlit's query params may return either:
+    - A list: {"access_token": ["abc123"]} when using dict-style access
+    - A string: "abc123" when using attribute-style access
+    
+    This helper normalizes both cases to return a plain string or None.
+    """
+    value = params_dict.get(key)
+    
+    if value is None:
+        return None
+    
+    # If it's a list, take the first element
+    if isinstance(value, list):
+        return value[0] if len(value) > 0 else None
+    
+    # If it's already a string, return it
+    if isinstance(value, str):
+        return value
+    
+    # Fallback: convert to string
+    return str(value) if value else None
+
+
+def _clear_query_params():
+    """
+    Clear query parameters from the browser URL.
+    
+    Compatible with both old and new Streamlit APIs:
+    - Streamlit >= 1.30: st.query_params.clear()
+    - Streamlit < 1.30: st.experimental_set_query_params()
+    
+    This ensures tokens and codes are removed from the browser URL
+    to prevent re-processing on page refresh/rerun.
+    """
+    try:
+        # Try new API first (Streamlit >= 1.30)
+        st.query_params.clear()
+    except AttributeError:
+        # Fallback to old API (Streamlit < 1.30)
+        try:
+            st.experimental_set_query_params()
+        except:
+            # If both fail, that's okay - we tried
+            pass
+
+
 # Handle OAuth callback - supports both PKCE (code) and implicit (tokens) flows
 def handle_oauth_callback():
-    """Handle OAuth callback with either authorization code or direct tokens."""
+    """
+    Handle OAuth callback with either authorization code or direct tokens.
+    
+    This function handles both:
+    1. PKCE flow: authorization code in query params
+    2. Implicit flow: access_token & refresh_token in query params (moved from fragment by JS)
+    
+    Key implementation details:
+    - Query params are normalized to strings (Streamlit returns lists via dict access)
+    - Supabase responses are accessed gracefully (both attribute and dict styles)
+    - Browser URL is cleared after processing to prevent re-processing on rerun
+    - Debug mode shows param types without exposing full token values
+    """
     if not SUPABASE_AVAILABLE:
         return
     
+    # Enable debug logging by setting DEBUG_OAUTH=true in environment or secrets
+    debug_mode = os.environ.get("DEBUG_OAUTH", "").lower() == "true"
+    if not debug_mode:
+        try:
+            debug_mode = st.secrets.get("DEBUG_OAUTH", False)
+        except:
+            pass
+    
+    # Get raw query params for inspection
+    try:
+        # Try new API first (Streamlit >= 1.30)
+        raw_params = dict(st.query_params)
+    except:
+        # Fallback to old API
+        raw_params = st.experimental_get_query_params()
+    
+    if debug_mode and raw_params:
+        st.write("🔍 DEBUG: Raw query params:", {k: f"<{type(v).__name__}> len={len(v) if isinstance(v, (list, str)) else '?'}" for k, v in raw_params.items()})
+    
     # Method 1: PKCE flow - Check for authorization code from OAuth redirect
-    if "code" in st.query_params:
-        code = st.query_params["code"]
+    if "code" in raw_params:
+        code = _get_query_param_as_string(raw_params, "code")
+        
+        if debug_mode:
+            st.write(f"🔍 DEBUG: PKCE flow detected, code type: {type(code).__name__}, length: {len(code) if code else 0}")
+        
+        if not code:
+            st.error("❌ Invalid authorization code received")
+            _clear_query_params()
+            st.rerun()
+            return
+        
         try:
             # Exchange authorization code for session
             response = supabase.auth.exchange_code_for_session(code)
-            if response.user:
+            
+            # Extract user info (handle both attribute-style and dict-style responses)
+            try:
+                user = response.user if hasattr(response, 'user') else response.get('user')
+                session = response.session if hasattr(response, 'session') else response.get('session')
+            except:
+                user = None
+                session = None
+            
+            if user:
+                # Extract user ID and email gracefully
+                user_id = user.id if hasattr(user, 'id') else user.get('id') if isinstance(user, dict) else None
+                user_email = user.email if hasattr(user, 'email') else user.get('email') if isinstance(user, dict) else "Unknown"
+                
                 st.session_state.user = {
-                    "id": response.user.id,
-                    "email": response.user.email
+                    "id": user_id,
+                    "email": user_email
                 }
-                st.session_state.session = response.session
+                st.session_state.session = session
                 
                 # Clear code from URL to prevent re-processing
-                st.query_params.clear()
-                st.success(f"✅ Logged in as {response.user.email}")
+                _clear_query_params()
+                st.success(f"✅ Logged in as {user_email}")
+                st.rerun()
+            else:
+                st.error("❌ Authentication failed: No user data returned")
+                _clear_query_params()
                 st.rerun()
         except Exception as e:
-            st.error(f"❌ Authentication failed: {e}")
-            st.query_params.clear()
+            st.error(f"❌ Authentication failed: {str(e)}")
+            if debug_mode:
+                st.exception(e)
+            _clear_query_params()
             st.rerun()
     
     # Method 2: Implicit flow - Check for tokens (passed from fragment via JS)
-    elif "access_token" in st.query_params and "refresh_token" in st.query_params:
-        access_token = st.query_params["access_token"]
-        refresh_token = st.query_params["refresh_token"]
+    elif "access_token" in raw_params and "refresh_token" in raw_params:
+        # Normalize query params to plain strings (Streamlit returns lists via dict access)
+        access_token = _get_query_param_as_string(raw_params, "access_token")
+        refresh_token = _get_query_param_as_string(raw_params, "refresh_token")
+        
+        if debug_mode:
+            st.write(f"🔍 DEBUG: Implicit flow detected")
+            st.write(f"  - access_token type: {type(access_token).__name__}, length: {len(access_token) if access_token else 0}")
+            st.write(f"  - refresh_token type: {type(refresh_token).__name__}, length: {len(refresh_token) if refresh_token else 0}")
+        
+        # Validate that both tokens exist and are non-empty strings
+        if not access_token or not refresh_token:
+            st.error("❌ Invalid tokens received (missing or empty)")
+            _clear_query_params()
+            st.rerun()
+            return
+        
+        if not isinstance(access_token, str) or not isinstance(refresh_token, str):
+            st.error(f"❌ Invalid token types (expected strings, got {type(access_token).__name__}, {type(refresh_token).__name__})")
+            _clear_query_params()
+            st.rerun()
+            return
+        
         try:
-            # Set session with the tokens from OAuth redirect
+            # Call Supabase set_session with plain strings (as required by the client)
             response = supabase.auth.set_session(access_token, refresh_token)
-            if response.user:
+            
+            # Extract user and session info (handle both attribute-style and dict-style responses)
+            try:
+                user = response.user if hasattr(response, 'user') else response.get('user') if isinstance(response, dict) else None
+                session = response.session if hasattr(response, 'session') else response.get('session') if isinstance(response, dict) else None
+            except:
+                user = None
+                session = None
+            
+            if user:
+                # Extract user ID and email gracefully
+                user_id = user.id if hasattr(user, 'id') else user.get('id') if isinstance(user, dict) else None
+                user_email = user.email if hasattr(user, 'email') else user.get('email') if isinstance(user, dict) else "Unknown"
+                
                 st.session_state.user = {
-                    "id": response.user.id,
-                    "email": response.user.email
+                    "id": user_id,
+                    "email": user_email
                 }
-                st.session_state.session = response.session
+                st.session_state.session = session
                 
                 # Clear tokens from URL to prevent re-processing
-                st.query_params.clear()
-                st.success(f"✅ Logged in as {response.user.email}")
+                # This uses Streamlit's API to clear query params from browser URL
+                _clear_query_params()
+                
+                st.success(f"✅ Logged in as {user_email}" if user_email != "Unknown" else "✅ Login successful!")
+                
+                if debug_mode:
+                    st.write("🔍 DEBUG: Session created successfully, user ID:", user_id)
+                
+                st.rerun()
+            else:
+                st.error("❌ Authentication failed: No user data returned from Supabase")
+                _clear_query_params()
                 st.rerun()
         except Exception as e:
-            st.error(f"❌ Authentication failed: {e}")
-            st.query_params.clear()
+            st.error(f"❌ Authentication failed: {str(e)}")
+            if debug_mode:
+                st.write("🔍 DEBUG: Exception details:")
+                st.exception(e)
+            _clear_query_params()
             st.rerun()
 
 # Persist session across reruns
