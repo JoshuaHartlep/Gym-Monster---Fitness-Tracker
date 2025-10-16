@@ -196,52 +196,122 @@ def handle_oauth_callback():
     
     # Method 1: PKCE flow - Check for authorization code from OAuth redirect
     if "code" in raw_params:
+        # Streamlit may return list values; normalize to string
         code = _get_query_param_as_string(raw_params, "code")
         
+        st.info("🔐 Detected auth code in URL — attempting to exchange for session...")
+        
         if debug_mode:
-            st.write(f"🔍 DEBUG: PKCE flow detected, code type: {type(code).__name__}, length: {len(code) if code else 0}")
+            st.write("🔍 DEBUG: Raw params keys:", list(raw_params.keys()))
+            st.write(f"🔍 DEBUG: code type: {type(code).__name__}, length: {len(code) if code else 0}")
         
         if not code:
-            st.error("❌ Invalid authorization code received")
+            st.error("❌ Invalid authorization code received (empty or missing)")
             _clear_query_params()
             st.rerun()
             return
         
         try:
-            # Exchange authorization code for session
-            response = supabase.auth.exchange_code_for_session(code)
+            # Exchange the auth code for a Supabase session
+            # NOTE: Method signature may differ by supabase-py version
+            # Try different call signatures to maximize compatibility
+            result = None
+            exchange_error = None
             
-            # Extract user info (handle both attribute-style and dict-style responses)
+            # Try method 1: Plain string argument (newer versions)
             try:
-                user = response.user if hasattr(response, 'user') else response.get('user')
-                session = response.session if hasattr(response, 'session') else response.get('session')
-            except:
-                user = None
-                session = None
+                result = supabase.auth.exchange_code_for_session(code)
+            except TypeError as e1:
+                exchange_error = e1
+                # Try method 2: Dict argument (some versions)
+                try:
+                    result = supabase.auth.exchange_code_for_session({"auth_code": code})
+                except Exception as e2:
+                    exchange_error = e2
             
-            if user:
-                # Extract user ID and email gracefully
-                user_id = user.id if hasattr(user, 'id') else user.get('id') if isinstance(user, dict) else None
-                user_email = user.email if hasattr(user, 'email') else user.get('email') if isinstance(user, dict) else "Unknown"
-                
-                st.session_state.user = {
-                    "id": user_id,
-                    "email": user_email
-                }
+            if result is None:
+                raise Exception(f"Could not exchange code (tried multiple signatures). Last error: {exchange_error}")
+            
+            # Result may be attribute-like or dict-like. Normalize carefully.
+            session = None
+            user = None
+            
+            # Try attribute-style access first
+            if hasattr(result, "session"):
+                session = getattr(result, "session", None)
+                user = getattr(result, "user", None)
+            # Try dict-style access
+            elif isinstance(result, dict):
+                session = result.get("session")
+                user = result.get("user")
+            # Last resort: check for data attribute (some SDK versions wrap response)
+            elif hasattr(result, "data"):
+                data = getattr(result, "data", {})
+                if isinstance(data, dict):
+                    session = data.get("session")
+                    user = data.get("user")
+            
+            if debug_mode:
+                st.write("🔍 DEBUG: Exchange result type:", type(result).__name__)
+                st.write("🔍 DEBUG: Session extracted:", "Yes" if session else "No")
+                st.write("🔍 DEBUG: User extracted:", "Yes" if user else "No")
+            
+            # If exchange succeeded, store session/user and clear the URL
+            if session is not None or user is not None:
                 st.session_state.session = session
+                
+                # Extract user details gracefully
+                if user:
+                    user_id = user.id if hasattr(user, 'id') else user.get('id') if isinstance(user, dict) else None
+                    user_email = user.email if hasattr(user, 'email') else user.get('email') if isinstance(user, dict) else None
+                    
+                    st.session_state.user = {
+                        "id": user_id,
+                        "email": user_email
+                    }
+                else:
+                    st.session_state.user = {"id": None, "email": None}
                 
                 # Clear code from URL to prevent re-processing
                 _clear_query_params()
-                st.success(f"✅ Logged in as {user_email}")
+                
+                user_email_display = st.session_state.user.get("email")
+                if user_email_display:
+                    st.success(f"✅ Signed in as {user_email_display}")
+                else:
+                    st.success("✅ Signed in successfully")
+                
+                if debug_mode:
+                    st.write("🔍 DEBUG: Session and user saved to st.session_state")
+                
                 st.rerun()
             else:
-                st.error("❌ Authentication failed: No user data returned")
+                # Exchange didn't return session/user — show debug info
+                st.error("❌ Exchange did not return a session or user. See debug output below.")
+                st.write("🔍 DEBUG: Exchange result:", result)
+                st.write("🔍 DEBUG: Result type:", type(result).__name__)
+                if hasattr(result, '__dict__'):
+                    st.write("🔍 DEBUG: Result attributes:", list(vars(result).keys()))
                 _clear_query_params()
                 st.rerun()
-        except Exception as e:
-            st.error(f"❌ Authentication failed: {str(e)}")
+        
+        except Exception as exc:
+            # Common exchange failures: PKCE verifier mismatch, expired code, redirect URI mismatch
+            st.error(f"❌ Auth code exchange failed: {str(exc)}")
+            
+            # Show debugging hints without exposing secrets
             if debug_mode:
-                st.exception(e)
+                st.write("🔍 DEBUG: Exception type:", type(exc).__name__)
+                st.write("🔍 DEBUG: Exception message (truncated):", str(exc)[:400])
+                st.write("🔍 DEBUG: Common causes:")
+                st.write("  - PKCE verifier mismatch (code_verifier not found or incorrect)")
+                st.write("  - Authorization code expired (codes expire quickly, usually 10 minutes)")
+                st.write("  - Redirect URI mismatch between initial auth request and exchange")
+                st.write("  - Code already used (codes are single-use)")
+            else:
+                st.info("💡 Enable DEBUG_OAUTH=true for detailed troubleshooting info")
+            
+            # Clear the code from URL to avoid loops
             _clear_query_params()
             st.rerun()
     
@@ -970,8 +1040,23 @@ def render_auth_ui():
             except:
                 redirect_url = "http://localhost:8501"
             
-            # Use PKCE flow for secure authorization code exchange
-            auth_url = f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?provider=google&redirect_to={redirect_url}&flow_type=pkce"
+            # Use Supabase Python client to generate proper PKCE OAuth URL
+            # This uses authorization code flow instead of implicit flow (more secure)
+            try:
+                # The sign_in_with_oauth method returns a response with the auth URL
+                oauth_response = supabase.auth.sign_in_with_oauth({
+                    "provider": "google",
+                    "options": {
+                        "redirect_to": redirect_url
+                    }
+                })
+                auth_url = oauth_response.url
+            except Exception as e:
+                # Fallback to manual URL construction if client method fails
+                # Using response_type=code for authorization code flow (not implicit)
+                # Note: This won't include PKCE challenge, so exchange may fail in some Supabase configs
+                st.warning(f"⚠️ Could not generate PKCE URL via SDK, using manual code flow: {e}")
+                auth_url = f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?provider=google&redirect_to={redirect_url}&response_type=code"
             
             # Large, prominent Google login button
             google_col1, google_col2, google_col3 = st.columns([1, 2, 1])
@@ -1637,13 +1722,29 @@ def _load_initial_data(csv_path: Optional[str]) -> pd.DataFrame:
 
 # Main UI
 def main():
+    # ===================================================================
+    # CRITICAL: OAuth handling must run FIRST, before any other code
+    # This ensures authorization codes/tokens are processed immediately
+    # on redirect, before any UI rendering or session state checks
+    # ===================================================================
+    
     st.set_page_config(page_title="Gym Monster", layout="wide")
     
-    # Extract tokens from URL fragment if present (for implicit flow)
+    # Step 1: Extract tokens from URL fragment if present (implicit flow)
+    # This JS component moves #access_token=... to ?access_token=...
+    # Must run before handle_oauth_callback() reads query params
     extract_fragment_tokens()
     
-    # Handle OAuth callback IMMEDIATELY after set_page_config
+    # Step 2: Handle OAuth callback - processes both PKCE and implicit flows
+    # This MUST run on every page load to catch redirects with ?code=... or ?access_token=...
+    # If code/tokens found: exchanges for session, saves to st.session_state, clears URL, reruns
+    # If not found: continues normally to main app
     handle_oauth_callback()
+    
+    # ===================================================================
+    # From this point on, OAuth redirects have been processed
+    # Safe to render UI and check session state
+    # ===================================================================
     
     st.title("Gym Monster")
     st.caption("Your weight trends, explained.")
