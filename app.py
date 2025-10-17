@@ -34,7 +34,7 @@ import pytz
 from dateutil import parser as dateparser
 import html
 import hashlib
-from urllib.parse import parse_qs
+import json as _json_for_js_escaping
 
 # Supabase imports
 from supabase import create_client, Client
@@ -138,174 +138,438 @@ except Exception as e:
     # Debug: Print the error for troubleshooting
     print(f"Supabase initialization failed: {e}")
 
-def _exchange_oauth_code_from_ctx() -> None:
-    """Exchange OAuth code using ScriptRunContext.query_string.
+PKCE_STORAGE_KEY = "mf_code_verifier"
+_PKCE_BRIDGE_STATE_KEY = "_pkce_requested_verifier"
 
-    Must be called after set_page_config and before any UI gating.
+
+def _extract_code_verifier_from_response(oauth_response) -> Optional[str]:
+    """Best-effort extraction of PKCE verifier from the Supabase SDK response."""
+    if oauth_response is None:
+        return None
+
+    attr_candidates = (
+        "code_verifier",
+        "codeVerifier",
+        "pkce_verifier",
+        "pkceVerifier",
+    )
+    for attr in attr_candidates:
+        value = getattr(oauth_response, attr, None)
+        if isinstance(value, str) and value:
+            return value
+
+    try:
+        for key, value in getattr(oauth_response, "__dict__", {}).items():
+            if isinstance(value, str) and value and "verifier" in key.lower():
+                return value
+    except Exception:
+        pass
+
+    for method_name in ("model_dump", "dict"):
+        method = getattr(oauth_response, method_name, None)
+        if callable(method):
+            try:
+                data = method()
+                if isinstance(data, dict):
+                    for key, value in data.items():
+                        if isinstance(value, str) and value and "verifier" in key.lower():
+                            return value
+            except Exception:
+                continue
+    return None
+
+
+def _pop_code_verifier_from_storage() -> Optional[str]:
+    """Fetch and remove any PKCE verifier cached in Streamlit-backed storage."""
+    storage = st.session_state.get("_supabase_storage")
+    if not isinstance(storage, dict):
+        return None
+
+    for key in list(storage.keys()):
+        value = storage.get(key)
+        if isinstance(value, str) and value and "verifier" in key.lower():
+            storage.pop(key, None)
+            return value
+    return None
+
+
+def _generate_manual_pkce_auth_url(redirect_url: str) -> Optional[Tuple[str, str]]:
+    """Manual PKCE fallback when the Supabase SDK cannot supply a verifier."""
+    try:
+        import secrets
+        import hashlib
+        import base64
+        from urllib.parse import quote
+
+        code_verifier_bytes = secrets.token_bytes(32)
+        code_verifier = base64.urlsafe_b64encode(code_verifier_bytes).decode("utf-8").rstrip("=")
+        challenge_bytes = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+        code_challenge = base64.urlsafe_b64encode(challenge_bytes).decode("utf-8").rstrip("=")
+
+        base_url = st.secrets["SUPABASE_URL"]
+        auth_url = (
+            f"{base_url}/auth/v1/authorize?"
+            f"provider=google&"
+            f"redirect_to={quote(redirect_url)}&"
+            f"response_type=code&"
+            f"code_challenge={code_challenge}&"
+            f"code_challenge_method=S256"
+        )
+        st.write(f"🔐 DEBUG: Generated manual PKCE verifier (length: {len(code_verifier)})")
+        return auth_url, code_verifier
+    except Exception as exc:
+        st.error("❌ Unable to build manual PKCE Google auth URL. Please check Supabase configuration.")
+        st.write(f"DEBUG: Manual PKCE generation failed: {type(exc).__name__}: {str(exc)[:160]}")
+        return None
+
+
+def _prepare_pkce_login(redirect_url: str) -> Optional[Tuple[str, str]]:
     """
+    Request Google OAuth URL and accompanying PKCE verifier.
+    Returns (auth_url, code_verifier) on success.
+    """
+    if not SUPABASE_AVAILABLE:
+        st.error("❌ Supabase client is unavailable. Cannot start Google login.")
+        return None
+
+    oauth_response = None
+    sdk_error: Optional[Exception] = None
+    try:
+        oauth_response = supabase.auth.sign_in_with_oauth(
+            {
+                "provider": "google",
+                "options": {"redirect_to": redirect_url},
+            }
+        )
+    except Exception as exc:
+        sdk_error = exc
+
+    auth_url = None
+    code_verifier = None
+
+    if oauth_response is not None:
+        auth_url = getattr(oauth_response, "url", None)
+        if not auth_url and isinstance(oauth_response, dict):
+            auth_url = oauth_response.get("url")
+
+        code_verifier = _extract_code_verifier_from_response(oauth_response)
+        if code_verifier:
+            st.write(f"🔐 DEBUG: Captured PKCE verifier via SDK (length: {len(code_verifier)})")
+
+    if code_verifier is None:
+        code_verifier = _pop_code_verifier_from_storage()
+        if code_verifier:
+            st.write(f"🔐 DEBUG: Retrieved PKCE verifier from storage (length: {len(code_verifier)})")
+
+    if auth_url and code_verifier:
+        return auth_url, code_verifier
+
+    if sdk_error:
+        st.warning(f"⚠️ Supabase SDK sign_in_with_oauth failed; using manual PKCE fallback: {str(sdk_error)[:160]}")
+
+    manual = _generate_manual_pkce_auth_url(redirect_url)
+    if manual:
+        return manual
+
+    st.error("❌ Unable to start Google OAuth flow. Please retry.")
+    return None
+
+
+def _render_pkce_bootstrap(auth_url: str, code_verifier: str) -> None:
+    """Persist verifier to browser storage and trigger Google OAuth redirect."""
+    if not auth_url or not code_verifier:
+        st.error("❌ Missing OAuth URL or verifier; cannot redirect.")
+        return
+
+    storage_key_json = json.dumps(PKCE_STORAGE_KEY)
+    verifier_json = json.dumps(code_verifier)
+    auth_url_json = json.dumps(auth_url)
+
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const storageKey = {storage_key_json};
+            const verifier = {verifier_json};
+            const topWindow = window.top || window;
+            try {{
+                topWindow.localStorage.setItem(storageKey, verifier);
+                console.log("PKCE code_verifier stored under", storageKey, "length:", verifier ? verifier.length : 0);
+            }} catch (storageErr) {{
+                console.error("Failed to persist PKCE verifier to localStorage", storageErr);
+            }}
+            try {{
+                const doc = topWindow.document;
+                const existing = doc.getElementById("mf_pkce_redirect_script");
+                if (existing && existing.parentNode) {{
+                    existing.parentNode.removeChild(existing);
+                }}
+                const scriptEl = doc.createElement("script");
+                scriptEl.id = "mf_pkce_redirect_script";
+                scriptEl.type = "text/javascript";
+                scriptEl.text = "(function(){{try{{window.location.assign({auth_url_json});}}catch(err){{console.error('MF PKCE redirect failed', err);}}}})();";
+                doc.head.appendChild(scriptEl);
+            }} catch (navErr) {{
+                console.error("Failed to inject redirect script", navErr);
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+    st.write(f"🔐 DEBUG: Stored PKCE verifier in browser storage (length: {len(code_verifier)})")
+
+    safe_url = html.escape(auth_url, quote=True)
+    st.markdown(
+        f"""
+        <a id="mf_google_login_fallback"
+           href="{safe_url}"
+           target="_self"
+           rel="noopener noreferrer"
+           style="display:inline-block; margin-top:0.75rem; padding:0.65em 1.4em; background:#1a73e8; color:white;
+                  border-radius:6px; font-weight:600; text-decoration:none;">
+            Continue to Google
+        </a>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.info("Redirecting to Google… If you are not redirected automatically, click the button above.")
+
+
+def _bootstrap_pkce_verifier_from_local_storage(params: Dict[str, List[str]]) -> bool:
+    """
+    Inject JS bridge that retrieves the PKCE verifier from browser storage.
+    Returns True if this run should halt after handling bridge UX.
+    """
+    code = _get_query_param_as_string(params, "code")
+    code_verifier = _get_query_param_as_string(params, "code_verifier")
+
+    if not code:
+        st.session_state.pop(_PKCE_BRIDGE_STATE_KEY, None)
+        return False
+
+    if code_verifier:
+        st.session_state.pop(_PKCE_BRIDGE_STATE_KEY, None)
+        return False
+
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const storageKey = {json.dumps(PKCE_STORAGE_KEY)};
+            const topWindow = window.top || window;
+            const params = new URLSearchParams(topWindow.location.search);
+            if (!params.has("code") || params.has("code_verifier")) {{
+                return;
+            }}
+            const stored = topWindow.localStorage.getItem(storageKey);
+            if (!stored) {{
+                return;
+            }}
+            params.set("code_verifier", stored);
+            topWindow.localStorage.removeItem(storageKey);
+            const newQuery = params.toString();
+            const newUrl = `${{topWindow.location.origin}}${{topWindow.location.pathname}}?${{newQuery}}`;
+            try {{
+                const doc = topWindow.document;
+                const scriptId = "mf_pkce_callback_script";
+                const existing = doc.getElementById(scriptId);
+                if (existing && existing.parentNode) {{
+                    existing.parentNode.removeChild(existing);
+                }}
+                const scriptEl = doc.createElement("script");
+                scriptEl.id = scriptId;
+                scriptEl.type = "text/javascript";
+                scriptEl.text = "(function(){{try{{window.location.replace(" + JSON.stringify(newUrl) + ");}}catch(err){{console.error('MF PKCE callback redirect failed', err);}}}})();";
+                doc.head.appendChild(scriptEl);
+
+                const linkId = "mf_pkce_callback_link";
+                let link = doc.getElementById(linkId);
+                if (!link) {{
+                    link = doc.createElement("a");
+                    link.id = linkId;
+                    link.textContent = "Complete Google sign-in";
+                    link.style.cssText = "display:inline-block;margin-top:1rem;padding:0.6em 1.4em;background:#1a73e8;color:white;border-radius:6px;font-weight:600;text-decoration:none;";
+                    doc.body.appendChild(link);
+                }}
+                link.href = newUrl;
+                link.target = "_self";
+            }} catch (err) {{
+                console.error("MF PKCE callback helper exception", err);
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
+
+    if not st.session_state.get(_PKCE_BRIDGE_STATE_KEY):
+        st.session_state[_PKCE_BRIDGE_STATE_KEY] = True
+        st.info("🔐 Completing Google login… please wait.")
+        st.stop()
+
+    st.error("❌ Missing PKCE verifier. Please restart the Google sign-in flow.")
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+    st.session_state.pop(_PKCE_BRIDGE_STATE_KEY, None)
+    return True
+
+
+def _extract_session_and_user(result):
+    """Normalize Supabase exchange response into (session, user)."""
+    session = getattr(result, "session", None)
+    user = getattr(result, "user", None)
+
+    data_attr = getattr(result, "data", None)
+    if isinstance(data_attr, dict):
+        session = session or data_attr.get("session")
+        user = user or data_attr.get("user")
+    elif data_attr is not None:
+        session = session or getattr(data_attr, "session", None)
+        user = user or getattr(data_attr, "user", None)
+
+    if isinstance(result, dict):
+        session = session or result.get("session")
+        user = user or result.get("user")
+        data_dict = result.get("data")
+        if isinstance(data_dict, dict):
+            session = session or data_dict.get("session")
+            user = user or data_dict.get("user")
+
+    return session, user
+
+
+def _perform_pkce_exchange(code: str, code_verifier: str) -> None:
+    """Exchange authorization code using Supabase with explicit PKCE verifier."""
+    flag_name = "_oauth_code_exchanged"
+
+    if not SUPABASE_AVAILABLE:
+        st.error("❌ Supabase client unavailable; cannot complete sign-in.")
+        st.session_state.pop(flag_name, None)
+        return
+
+    st.write("🔐 DEBUG: Attempting PKCE exchange via Supabase…")
+    st.write(f"🔐 DEBUG: code present: {bool(code)}")
+    st.write(f"🔐 DEBUG: code_verifier found: {bool(code_verifier)}, length: {len(code_verifier) if code_verifier else 0}")
+
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+    try:
+        result = supabase.auth.exchange_code_for_session(
+            {
+                "auth_code": code,
+                "code_verifier": code_verifier,
+            }
+        )
+    except Exception as exc:
+        st.error("❌ Supabase PKCE exchange failed. Please retry the Google login.")
+        st.write(f"DEBUG: exchange exception (truncated): {type(exc).__name__}: {str(exc)[:200]}")
+        st.session_state.pop(flag_name, None)
+        return
+
+    session, user = _extract_session_and_user(result)
+    st.write(f"🔐 DEBUG: Session returned: {session is not None}")
+    st.write(f"🔐 DEBUG: User returned: {user is not None}")
+
+    if not session and not user:
+        st.error("❌ Supabase exchange returned no session. Please try logging in again.")
+        st.session_state.pop(flag_name, None)
+        return
+
+    st.session_state.session = session
+
+    resolved_user = {}
+    if user:
+        email = getattr(user, "email", None)
+        if email is None and isinstance(user, dict):
+            email = user.get("email")
+        resolved_user["email"] = email
+        resolved_user["id"] = getattr(user, "id", None) if hasattr(user, "id") else (user.get("id") if isinstance(user, dict) else None)
+    st.session_state.user = resolved_user or {"email": None}
+
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
+    email_display = st.session_state.user.get("email")
+    if email_display:
+        st.success(f"✅ Signed in as {email_display}")
+    else:
+        st.success("✅ Signed in successfully.")
+
+    st.session_state.pop(_PKCE_BRIDGE_STATE_KEY, None)
+    st.session_state.pop(flag_name, None)
+
+    try:
+        st.rerun()
+    except Exception:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
+
+
+def _exchange_oauth_code_from_ctx() -> None:
+    """Legacy context-based PKCE exchange, now using explicit verifier handling."""
     st.write("🔧 DEBUG: _exchange_oauth_code_from_ctx() called")
-    
+
     if not SUPABASE_AVAILABLE:
         st.write("🔧 DEBUG: SUPABASE_AVAILABLE is False, returning")
         return
-    
+
     try:
-        from streamlit.runtime.scriptrunner.script_run_context import get_script_run_ctx  # type: ignore
-        ctx = get_script_run_ctx()
-        raw_qs = getattr(ctx, "query_string", None)
-        st.write(f"🔧 DEBUG: Got ctx.query_string: {repr(raw_qs)}")
-    except Exception as e:
-        st.write(f"🔧 DEBUG: Failed to get context: {e}")
-        raw_qs = None
+        params_raw = dict(st.query_params)
+    except Exception:
+        params_raw = {}
+    params = dict(params_raw or {})
+
+    if not params:
+        try:
+            from streamlit.runtime.scriptrunner.script_run_context import get_script_run_ctx  # type: ignore
+
+            ctx = get_script_run_ctx()
+            raw_qs = getattr(ctx, "query_string", "") or ""
+            if raw_qs:
+                from urllib.parse import parse_qs
+
+                parsed = parse_qs(raw_qs)
+                if parsed:
+                    params = {k: v for k, v in parsed.items()}
+                    st.session_state._manual_query_params = parsed
+                    st.write(f"DEBUG: Loaded query params from context: {list(parsed.keys())}")
+        except Exception as ctx_err:
+            st.write(f"DEBUG: Context query fallback failed: {type(ctx_err).__name__}: {str(ctx_err)[:120]}")
+    st.write(f"🔧 DEBUG: ctx query params keys: {list(params.keys())}")
+
+    code = _get_query_param_as_string(params, "code")
+    code_verifier = _get_query_param_as_string(params, "code_verifier")
+
+    st.write(f"🔧 DEBUG: code present: {bool(code)}")
+    st.write(f"🔧 DEBUG: code_verifier present: {bool(code_verifier)}, length: {len(code_verifier) if code_verifier else 0}")
 
     flag_name = "_oauth_code_exchanged"
 
-    if not raw_qs:
-        st.write("🔧 DEBUG: raw_qs is empty, returning")
+    if not code:
+        st.session_state.pop(flag_name, None)
         return
 
-    st.write(f"🔧 DEBUG: Parsing query string: {raw_qs}")
-    
-    try:
-        params = parse_qs(raw_qs)
-        st.write(f"🔧 DEBUG: Parsed params: {list(params.keys())}")
-        code = params.get("code", [None])[0]
-        st.write(f"🔧 DEBUG: Extracted code: {code[:20] if code else None}...")
-        
-        if not code:
-            st.write("🔧 DEBUG: No code found in params, returning")
-            return
-        if flag_name in st.session_state:
-            st.write("🔧 DEBUG: Already exchanged (flag set), returning")
-            return
-        
-        st.session_state[flag_name] = True
-        st.info("🔐 Detected auth code — exchanging for session...")
+    if not code_verifier:
+        st.write("🔧 DEBUG: code_verifier missing in context exchange; waiting for browser bridge.")
+        return
 
-        result = None
-        exc = None
-        
-        # Check if we have a PKCE code_verifier stored
-        code_verifier = None
-        if '_supabase_storage' in st.session_state:
-            storage_dict = st.session_state._supabase_storage
-            st.write(f"🔧 DEBUG: Storage keys: {list(storage_dict.keys())}")
-            # Look for code_verifier (key format may vary)
-            for key in storage_dict:
-                if 'verifier' in key.lower() or 'code' in key.lower():
-                    st.write(f"🔧 DEBUG: Found potential verifier key: {key}")
-                    code_verifier = storage_dict.get(key)
-                    break
-        else:
-            st.write("🔧 DEBUG: No _supabase_storage in session_state")
-        
-        st.write(f"🔧 DEBUG: code_verifier found: {code_verifier is not None}")
-        
-        # Try exchange with PKCE verifier if available
-        if code_verifier:
-            st.write("🔧 DEBUG: Attempting exchange WITH code_verifier...")
-            try:
-                result = supabase.auth.exchange_code_for_session({
-                    "auth_code": code,
-                    "code_verifier": code_verifier
-                })
-                st.write("🔧 DEBUG: Exchange with verifier succeeded!")
-            except Exception as e_pkce:
-                st.write(f"🔧 DEBUG: Exchange with verifier failed: {type(e_pkce).__name__}: {str(e_pkce)[:200]}")
-                exc = e_pkce
-        else:
-            st.write("🔧 DEBUG: No code_verifier - trying without PKCE...")
-            # Try without verifier (might fail if PKCE is required)
-            try:
-                result = supabase.auth.exchange_code_for_session({"auth_code": code})
-                st.write("🔧 DEBUG: Exchange without verifier succeeded!")
-            except Exception as e1:
-                st.write(f"🔧 DEBUG: Exchange failed: {type(e1).__name__}: {str(e1)[:200]}")
-                exc = e1
-        
-        st.write(f"🔧 DEBUG: After exchange attempts - result is None: {result is None}")
-        
-        if result is None:
-            st.error(f"❌ Exchange failed!")
-            st.write(f"Last exception: {exc}")
-            if code_verifier is None:
-                st.warning("⚠️ PKCE code_verifier not found in storage. This is likely why exchange is failing.")
-                st.write("The auth URL generation may have failed, or the verifier wasn't persisted.")
-            raise Exception(f"Supabase exchange failed: {exc}")
+    if st.session_state.get(flag_name):
+        st.write("🔧 DEBUG: Already exchanged (flag set), returning")
+        return
 
-        st.write(f"🔧 DEBUG: Exchange result type: {type(result)}")
-        st.write(f"🔧 DEBUG: Exchange result repr: {repr(result)[:300]}...")
-        
-        # Normalize response - handle string, dict, and object types
-        session = None
-        user = None
-        
-        if isinstance(result, str):
-            # Result is a plain string - unusual, log it
-            st.error(f"⚠️ Exchange returned a string: {result[:100]}...")
-            st.write("This is unexpected - exchange should return session/user objects")
-            return
-        elif isinstance(result, dict):
-            st.write("🔧 DEBUG: Result is dict, extracting session/user")
-            data = result.get("data") if isinstance(result.get("data"), dict) else None
-            session = result.get("session") or (data or {}).get("session")
-            user = result.get("user") or (data or {}).get("user")
-        else:
-            st.write(f"🔧 DEBUG: Result is object ({type(result).__name__}), using attribute access")
-            data_attr = getattr(result, "data", None)
-            session = getattr(result, "session", None) or (getattr(data_attr, "session", None) if data_attr else None)
-            user = getattr(result, "user", None) or (getattr(data_attr, "user", None) if data_attr else None)
-        
-        st.write(f"🔧 DEBUG: Extracted session: {session is not None}")
-        st.write(f"🔧 DEBUG: Extracted user: {user is not None}")
-
-        if session or user:
-            email = None
-            try:
-                email = getattr(user, "email", None) if user else None
-                if email is None and isinstance(user, dict):
-                    email = user.get("email")
-            except Exception:
-                pass
-
-            st.session_state.session = session
-            st.session_state.user = {"email": email} if email else ({"email": None} if user else {})
-            st.success(f"✅ Signed in{(' as ' + st.session_state.user.get('email')) if st.session_state.user.get('email') else ''}")
-
-            try:
-                st.query_params.clear()
-            except Exception:
-                try:
-                    st.query_params.clear()
-                except Exception:
-                    pass
-            try:
-                st.rerun()
-            except Exception:
-                try:
-                    st.experimental_rerun()
-                except Exception:
-                    pass
-        else:
-            st.error("❌ Exchange completed but no session/user returned.")
-            try:
-                st.write("DEBUG: raw exchange result:", str(result)[:800])
-            except Exception:
-                pass
-            try:
-                st.query_params.clear()
-            except Exception:
-                pass
-    except Exception as ex:
-        st.error("❌ Auth code exchange failed.")
-        try:
-            st.write("DEBUG: exchange exception (truncated):", repr(ex)[:800])
-        except Exception:
-            pass
-        try:
-            st.query_params.clear()
-        except Exception:
-            pass
+    st.session_state[flag_name] = True
+    st.info("🔐 Detected auth code — exchanging for session...")
+    _perform_pkce_exchange(code, code_verifier)
 
 def _get_query_param_as_string(params_dict, key):
     """
@@ -346,14 +610,11 @@ def _clear_query_params():
     to prevent re-processing on page refresh/rerun.
     """
     try:
-        # Try new API first (Streamlit >= 1.30)
         st.query_params.clear()
-    except AttributeError:
-        # Fallback to old API (Streamlit < 1.30)
+    except Exception:
         try:
             st.query_params.clear()
-        except:
-            # If both fail, that's okay - we tried
+        except Exception:
             pass
 
 
@@ -413,124 +674,34 @@ def handle_oauth_callback():
     
     # Method 1: PKCE flow - Check for authorization code from OAuth redirect
     if "code" in raw_params:
-        # Streamlit may return list values; normalize to string
         code = _get_query_param_as_string(raw_params, "code")
-        
-        st.info("🔐 Detected auth code in URL — attempting to exchange for session...")
-        
-        if debug_mode:
-            st.write("🔍 DEBUG: Raw params keys:", list(raw_params.keys()))
-            st.write(f"🔍 DEBUG: code type: {type(code).__name__}, length: {len(code) if code else 0}")
-        
+        code_verifier = _get_query_param_as_string(raw_params, "code_verifier")
+
+        st.write(f"🔧 DEBUG: handle_oauth_callback(): code present: {bool(code)}")
+        st.write(f"🔧 DEBUG: handle_oauth_callback(): code_verifier found: {bool(code_verifier)}, length: {len(code_verifier) if code_verifier else 0}")
+
         if not code:
-            st.error("❌ Invalid authorization code received (empty or missing)")
-            _clear_query_params()
-            st.rerun()
-            return
-        
-        try:
-            # Exchange the auth code for a Supabase session
-            # NOTE: Method signature may differ by supabase-py version
-            # Try different call signatures to maximize compatibility
-            result = None
-            exchange_error = None
-            
-            # Try method 1: Plain string argument (newer versions)
+            st.error("❌ Invalid authorization code received (empty or missing).")
             try:
-                result = supabase.auth.exchange_code_for_session(code)
-            except TypeError as e1:
-                exchange_error = e1
-                # Try method 2: Dict argument (some versions)
-                try:
-                    result = supabase.auth.exchange_code_for_session({"auth_code": code})
-                except Exception as e2:
-                    exchange_error = e2
-            
-            if result is None:
-                raise Exception(f"Could not exchange code (tried multiple signatures). Last error: {exchange_error}")
-            
-            # Result may be attribute-like or dict-like. Normalize carefully.
-            session = None
-            user = None
-            
-            # Try attribute-style access first
-            if hasattr(result, "session"):
-                session = getattr(result, "session", None)
-                user = getattr(result, "user", None)
-            # Try dict-style access
-            elif isinstance(result, dict):
-                session = result.get("session")
-                user = result.get("user")
-            # Last resort: check for data attribute (some SDK versions wrap response)
-            elif hasattr(result, "data"):
-                data = getattr(result, "data", {})
-                if isinstance(data, dict):
-                    session = data.get("session")
-                    user = data.get("user")
-            
-            if debug_mode:
-                st.write("🔍 DEBUG: Exchange result type:", type(result).__name__)
-                st.write("🔍 DEBUG: Session extracted:", "Yes" if session else "No")
-                st.write("🔍 DEBUG: User extracted:", "Yes" if user else "No")
-            
-            # If exchange succeeded, store session/user and clear the URL
-            if session is not None or user is not None:
-                st.session_state.session = session
-                
-                # Extract user details gracefully
-                if user:
-                    user_id = user.id if hasattr(user, 'id') else user.get('id') if isinstance(user, dict) else None
-                    user_email = user.email if hasattr(user, 'email') else user.get('email') if isinstance(user, dict) else None
-                    
-                    st.session_state.user = {
-                        "id": user_id,
-                        "email": user_email
-                    }
-                else:
-                    st.session_state.user = {"id": None, "email": None}
-                
-                # Clear code from URL to prevent re-processing
-                _clear_query_params()
-                
-                user_email_display = st.session_state.user.get("email")
-                if user_email_display:
-                    st.success(f"✅ Signed in as {user_email_display}")
-                else:
-                    st.success("✅ Signed in successfully")
-                
-                if debug_mode:
-                    st.write("🔍 DEBUG: Session and user saved to st.session_state")
-                
-                st.rerun()
-            else:
-                # Exchange didn't return session/user — show debug info
-                st.error("❌ Exchange did not return a session or user. See debug output below.")
-                st.write("🔍 DEBUG: Exchange result:", result)
-                st.write("🔍 DEBUG: Result type:", type(result).__name__)
-                if hasattr(result, '__dict__'):
-                    st.write("🔍 DEBUG: Result attributes:", list(vars(result).keys()))
-                _clear_query_params()
-                st.rerun()
-        
-        except Exception as exc:
-            # Common exchange failures: PKCE verifier mismatch, expired code, redirect URI mismatch
-            st.error(f"❌ Auth code exchange failed: {str(exc)}")
-            
-            # Show debugging hints without exposing secrets
-            if debug_mode:
-                st.write("🔍 DEBUG: Exception type:", type(exc).__name__)
-                st.write("🔍 DEBUG: Exception message (truncated):", str(exc)[:400])
-                st.write("🔍 DEBUG: Common causes:")
-                st.write("  - PKCE verifier mismatch (code_verifier not found or incorrect)")
-                st.write("  - Authorization code expired (codes expire quickly, usually 10 minutes)")
-                st.write("  - Redirect URI mismatch between initial auth request and exchange")
-                st.write("  - Code already used (codes are single-use)")
-            else:
-                st.info("💡 Enable DEBUG_OAUTH=true for detailed troubleshooting info")
-            
-            # Clear the code from URL to avoid loops
-            _clear_query_params()
-            st.rerun()
+                st.query_params.clear()
+            except Exception:
+                pass
+            return
+
+        if not code_verifier:
+            st.error("❌ Missing PKCE verifier. Please retry the Google sign-in button.")
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+            return
+
+        if not st.session_state.get("_oauth_code_exchanged"):
+            st.info("🔐 Finalizing Google sign-in…")
+            _perform_pkce_exchange(code, code_verifier)
+        else:
+            st.write("🔧 DEBUG: PKCE exchange already processed upstream; skipping duplicate handling.")
+        return
     
     # Method 2: Implicit flow - Check for tokens (passed from fragment via JS)
     elif "access_token" in raw_params and "refresh_token" in raw_params:
@@ -1257,55 +1428,17 @@ def render_auth_ui():
             except:
                 redirect_url = "http://localhost:8501"
             
-            # Use Supabase Python client to generate proper PKCE OAuth URL
-            # This uses authorization code flow instead of implicit flow (more secure)
-            try:
-                # The sign_in_with_oauth method returns a response with the auth URL
-                oauth_response = supabase.auth.sign_in_with_oauth({
-                    "provider": "google",
-                    "options": {
-                        "redirect_to": redirect_url
-                    }
-                })
-                auth_url = oauth_response.url
-                st.write("✅ DEBUG: Generated PKCE URL via SDK successfully")
-            except Exception as e:
-                # Fallback: Manually generate PKCE challenge and verifier
-                st.warning(f"⚠️ SDK failed, generating PKCE manually: {str(e)[:100]}")
-                
-                import secrets
-                import hashlib
-                import base64
-                from urllib.parse import quote
-                
-                # Generate PKCE code_verifier (random string)
-                code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
-                
-                # Generate code_challenge from verifier (SHA256 hash)
-                challenge_bytes = hashlib.sha256(code_verifier.encode('utf-8')).digest()
-                code_challenge = base64.urlsafe_b64encode(challenge_bytes).decode('utf-8').rstrip('=')
-                
-                # Store verifier in session state (will persist across redirect)
-                if '_supabase_storage' not in st.session_state:
-                    st.session_state._supabase_storage = {}
-                st.session_state._supabase_storage['code_verifier'] = code_verifier
-                
-                st.write(f"🔧 DEBUG: Generated PKCE manually, stored verifier (length: {len(code_verifier)})")
-                
-                # Build OAuth URL with PKCE parameters
-                auth_url = (
-                    f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?"
-                    f"provider=google&"
-                    f"redirect_to={quote(redirect_url)}&"
-                    f"response_type=code&"
-                    f"code_challenge={code_challenge}&"
-                    f"code_challenge_method=S256"
-                )
-            
             # Large, prominent Google login button
             google_col1, google_col2, google_col3 = st.columns([1, 2, 1])
             with google_col2:
-                st.markdown(f"[🔑 **Login with Google**]({auth_url})", unsafe_allow_html=True)
+                if st.button("🔑 **Login with Google**", key="google_oauth_btn", use_container_width=True, type="primary"):
+                    pkce_payload = _prepare_pkce_login(redirect_url)
+                    if pkce_payload:
+                        auth_url, code_verifier = pkce_payload
+                        _render_pkce_bootstrap(auth_url, code_verifier)
+                        st.stop()
+                    else:
+                        st.error("❌ Unable to start Google OAuth. Please try again.")
             
             # Note about Google login
             st.info("🔐 Sign in with your Google account for quick access and data persistence across devices.")
@@ -1985,66 +2118,25 @@ def main():
     _inject_oauth_url_fix()
     st.write("🔧 DEBUG: _inject_oauth_url_fix() completed")
     
-    # Debug: Show query params after reload
     try:
-        _debug_params = dict(st.query_params)
-        st.write(f"🔧 DEBUG: st.query_params keys: {list(_debug_params.keys())}")
-        if _debug_params:
-            st.write("✅ DEBUG: Query params available:", list(_debug_params.keys()))
-        else:
-            st.error("⚠️ Streamlit Bug: OAuth redirect detected but query params are empty!")
-            st.write("**WORKAROUND: Please press F5 or Ctrl+R (Cmd+R on Mac) to refresh the page.**")
-            st.write("")
-            st.write("After you refresh, the `?code=...` in your browser URL will be sent to the server properly.")
-            st.info("💡 This is a known Streamlit limitation: OAuth redirects use SPA navigation which doesn't send query params to the server. A manual refresh fixes it.")
-            
-            # Try reading from streamlit internals as last resort
-            st.write("🔧 DEBUG: Attempting to read query string from request context...")
-            try:
-                from streamlit.runtime.scriptrunner.script_run_context import get_script_run_ctx
-                from streamlit.web.server.websocket_headers import _get_websocket_headers
-                
-                ctx = get_script_run_ctx()
-                st.write(f"🔧 DEBUG: Context type: {type(ctx)}")
-                
-                # ACCESS THE QUERY STRING DIRECTLY FROM CONTEXT!
-                if hasattr(ctx, 'query_string'):
-                    query_str = ctx.query_string
-                    st.write(f"✅✅✅ FOUND IT! Context.query_string: {query_str}")
-                    
-                    # Parse the query string manually
-                    from urllib.parse import parse_qs
-                    if query_str:
-                        parsed = parse_qs(query_str)
-                        st.write(f"✅ Parsed query params: {list(parsed.keys())}")
-                        
-                        # Store in session state so OAuth handler can use it
-                        st.session_state._manual_query_params = parsed
-                        st.success(f"✅ Successfully extracted query params from context: {list(parsed.keys())}")
-                    else:
-                        st.write("Query string exists but is empty")
-                else:
-                    st.write("No query_string attribute found")
-                    
-                # Try to access through st.runtime
-                try:
-                    from streamlit import runtime
-                    if hasattr(runtime, 'get_instance'):
-                        instance = runtime.get_instance()
-                        st.write(f"🔧 DEBUG: Runtime instance: {type(instance)}")
-                except Exception as rt_e:
-                    st.write(f"🔧 DEBUG: Runtime access failed: {rt_e}")
-                    
-            except Exception as ctx_e:
-                st.write(f"🔧 DEBUG: Context access failed: {ctx_e}")
-                
-            # Last resort: Try parsing from environment or headers
-            st.write("🔧 DEBUG: Checking if query string is in environment...")
-            import os
-            query_env = os.environ.get('QUERY_STRING', '')
-            st.write(f"🔧 DEBUG: QUERY_STRING env var: {query_env}")
-    except Exception as e:
-        st.write(f"⚠️ DEBUG: Could not read query params: {e}")
+        params_raw = dict(st.query_params)
+    except Exception:
+        params_raw = {}
+    params = dict(params_raw or {})
+    code_param = _get_query_param_as_string(params, "code")
+    code_verifier_param = _get_query_param_as_string(params, "code_verifier")
+
+    # TODO: Remove these debug prints after validating PKCE localStorage flow.
+    st.write("DEBUG: query_params:", list(params.keys()))
+    st.write("DEBUG: code present:", bool(code_param))
+    st.write(
+        "DEBUG: code_verifier found:",
+        bool(code_verifier_param),
+        "length:",
+        len(code_verifier_param) if code_verifier_param else 0,
+    )
+
+    _bootstrap_pkce_verifier_from_local_storage(params)
     
     # Step 2: Handle OAuth callback - processes both PKCE and implicit flows
     # This MUST run on every page load to catch redirects with ?code=... or ?access_token=...
