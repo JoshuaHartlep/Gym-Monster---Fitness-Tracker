@@ -129,8 +129,8 @@ try:
     if ClientOptions is not None:
         options = ClientOptions(storage=StreamlitSessionStorage())
         supabase: Client = create_client(url, key, options=options)
+    else:
         supabase: Client = create_client(url, key)
-    supabase: Client = create_client(url, key)
     SUPABASE_AVAILABLE = True
 except Exception as e:
     supabase = None
