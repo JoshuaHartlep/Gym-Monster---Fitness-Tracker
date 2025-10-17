@@ -37,6 +37,10 @@ import hashlib
 
 # Supabase imports
 from supabase import create_client, Client
+try:
+    from supabase.lib.client_options import ClientOptions
+except Exception:  # pragma: no cover - older supabase-py versions
+    ClientOptions = None
 
 # SciPy is optional for robust Theil–Sen. Fall back to simple OLS if unavailable.
 try:
@@ -48,6 +52,34 @@ except Exception:  # pragma: no cover
 
 import streamlit as st
 import streamlit.components.v1 as components
+
+
+class StreamlitSessionStorage:
+    """
+    Streamlit-backed storage for Supabase auth data.
+
+    Supabase's PKCE flow stores the code_verifier in the auth client's storage.
+    In Streamlit, the script reruns after each redirect, so the default in-memory
+    storage would be wiped. This storage keeps values inside st.session_state so
+    the verifier survives the redirect and the ensuing rerun.
+    """
+
+    def __init__(self, state_key: str = "_supabase_storage"):
+        self.state_key = state_key
+
+    def _store(self) -> dict:
+        if self.state_key not in st.session_state:
+            st.session_state[self.state_key] = {}
+        return st.session_state[self.state_key]
+
+    def get_item(self, key: str):
+        return self._store().get(key)
+
+    def set_item(self, key: str, value: str) -> None:
+        self._store()[key] = value
+
+    def remove_item(self, key: str) -> None:
+        self._store().pop(key, None)
 
 
 # -------------------------------
@@ -62,7 +94,11 @@ LOCAL_TZ = pytz.timezone("America/Chicago")
 try:
     url = st.secrets["SUPABASE_URL"]
     key = st.secrets["SUPABASE_ANON_KEY"]
-    supabase: Client = create_client(url, key)
+    if ClientOptions is not None:
+        options = ClientOptions(storage=StreamlitSessionStorage())
+        supabase: Client = create_client(url, key, options=options)
+    else:  # pragma: no cover - fallback for very old supabase-py
+        supabase: Client = create_client(url, key)
     SUPABASE_AVAILABLE = True
 except Exception as e:
     supabase = None
@@ -70,63 +106,118 @@ except Exception as e:
     # Debug: Print the error for troubleshooting
     print(f"Supabase initialization failed: {e}")
 
-def extract_fragment_tokens():
+def extract_oauth_params():
     """
-    Extract OAuth tokens from URL fragment using JavaScript.
+    Extract OAuth parameters from URL (both fragment and query string).
     
-    This component MUST run early in the page lifecycle, before any code
-    that reads st.query_params, because it moves tokens from the URL fragment
-    (#access_token=...) to query params (?access_token=...) that Streamlit can read.
+    Streamlit's st.query_params has a bug where it's empty after external redirects.
+    This uses JavaScript injected into the main page (not iframe) to read the URL
+    and store params in localStorage, which Python can then read via another component.
+    
+    Returns the OAuth params dict if found, else empty dict.
     """
     if not SUPABASE_AVAILABLE:
-        return
+        return {}
     
-    # JavaScript to extract tokens from URL fragment and redirect with query params
-    components.html(
-        """
-        <script>
-        // Check if there are OAuth tokens in the URL fragment
+    # Initialize session state key for OAuth params
+    if '_oauth_params_from_js' not in st.session_state:
+        st.session_state._oauth_params_from_js = {}
+    
+    # Inject JavaScript into main page to read URL and store in localStorage
+    st.markdown("""
+    <script>
+    (function() {
+        // Read URL parameters from main page
+        const params = {};
+        const searchParams = new URLSearchParams(window.location.search);
+        
+        if (searchParams.has('code')) {
+            params.code = searchParams.get('code');
+        }
+        if (searchParams.has('access_token')) {
+            params.access_token = searchParams.get('access_token');
+        }
+        if (searchParams.has('refresh_token')) {
+            params.refresh_token = searchParams.get('refresh_token');
+        }
+        
+        // Check fragment too
         if (window.location.hash) {
-            const hash = window.location.hash.substring(1);
-            const params = new URLSearchParams(hash);
-            const accessToken = params.get('access_token');
-            const refreshToken = params.get('refresh_token');
-            
-            if (accessToken && refreshToken) {
-                // Redirect to same page with tokens in query params (which Streamlit can read)
-                const url = new URL(window.location.href.split('#')[0]);
-                url.searchParams.set('access_token', accessToken);
-                url.searchParams.set('refresh_token', refreshToken);
-                // Redirect without fragment
-                window.location.replace(url.toString());
+            const hashParams = new URLSearchParams(window.location.hash.substring(1));
+            if (hashParams.has('access_token')) {
+                params.access_token = hashParams.get('access_token');
+            }
+            if (hashParams.has('refresh_token')) {
+                params.refresh_token = hashParams.get('refresh_token');
+            }
+        }
+        
+        console.log('🔧 MAIN PAGE URL:', window.location.href);
+        console.log('🔧 MAIN PAGE search:', window.location.search);
+        console.log('🔧 MAIN PAGE found params:', params);
+        
+        // Store in localStorage so iframe component can read it
+        if (Object.keys(params).length > 0) {
+            localStorage.setItem('_oauth_params', JSON.stringify(params));
+            console.log('🔧 Stored in localStorage');
+        }
+    })();
+    </script>
+    """, unsafe_allow_html=True)
+    
+    # Now use a component to read from localStorage and return to Python
+    result = components.html("""
+        <script>
+        const stored = localStorage.getItem('_oauth_params');
+        console.log('🔧 IFRAME reading localStorage:', stored);
+        if (stored) {
+            const params = JSON.parse(stored);
+            console.log('🔧 IFRAME parsed params:', params);
+            // Clear it so we don't re-use it
+            localStorage.removeItem('_oauth_params');
+            // Send to Streamlit
+            if (window.parent && window.parent.Streamlit) {
+                window.parent.Streamlit.setComponentValue(params);
+            }
+        } else {
+            // Return empty dict
+            if (window.parent && window.parent.Streamlit) {
+                window.parent.Streamlit.setComponentValue({});
             }
         }
         </script>
-        """,
-        height=0,
-    )
+    """, height=0)
+    
+    st.write(f"🔧 DEBUG: Component returned: {result} (type: {type(result)})")
+    
+    # Store result in session state if it's a dict
+    if result and isinstance(result, dict) and len(result) > 0:
+        st.session_state._oauth_params_from_js = result
+        return result
+    
+    return st.session_state._oauth_params_from_js or {}
 
 
 def _get_query_param_as_string(params_dict, key):
     """
     Safely extract a query parameter as a plain string.
     
-    Streamlit's query params may return either:
-    - A list: {"access_token": ["abc123"]} when using dict-style access
-    - A string: "abc123" when using attribute-style access
+    Handles values from multiple sources:
+    - JavaScript component: {"code": "abc123"} - plain strings
+    - Streamlit query params: {"code": ["abc123"]} - lists
     
-    This helper normalizes both cases to return a plain string or None.
+    This helper normalizes all cases to return a plain string or None.
     """
     value = params_dict.get(key)
     
     if value is None:
         return None
     
-    # If it's a list, take the first element
+    # If it's a list, take the first element (Streamlit behavior)
     if isinstance(value, list):
         return value[0] if len(value) > 0 else None
     
-    # If it's already a string, return it
+    # If it's already a string, return it (JavaScript component behavior)
     if isinstance(value, str):
         return value
     
@@ -172,7 +263,11 @@ def handle_oauth_callback():
     - Browser URL is cleared after processing to prevent re-processing on rerun
     - Debug mode shows param types without exposing full token values
     """
+    # TEMPORARY DEBUG: Always show we're being called
+    st.write("🔧 DEBUG: handle_oauth_callback() is running")
+    
     if not SUPABASE_AVAILABLE:
+        st.write("⚠️ DEBUG: SUPABASE_AVAILABLE is False - handler exiting early")
         return
     
     # Enable debug logging by setting DEBUG_OAUTH=true in environment or secrets
@@ -183,13 +278,37 @@ def handle_oauth_callback():
         except:
             pass
     
-    # Get raw query params for inspection
+    st.write(f"🔧 DEBUG: debug_mode = {debug_mode}")
+    
+    # WORKAROUND: Streamlit's st.query_params is empty after OAuth redirect
+    # Check if we've already processed params or if we need to wait
+    if '_oauth_check_count' not in st.session_state:
+        st.session_state._oauth_check_count = 0
+    
+    # Try reading query params directly
     try:
-        # Try new API first (Streamlit >= 1.30)
-        raw_params = dict(st.query_params)
-    except:
-        # Fallback to old API
-        raw_params = st.experimental_get_query_params()
+        raw_params = dict(st.query_params.items()) if hasattr(st.query_params, 'items') else {}
+        st.write(f"🔧 DEBUG: st.query_params.items(): {raw_params}")
+    except Exception as e:
+        st.write(f"🔧 DEBUG: Failed to read query params: {e}")
+        raw_params = {}
+    
+    # If empty and we haven't tried many times, trigger rerun
+    # (Sometimes Streamlit needs a rerun after redirect to populate query params)
+    if not raw_params and st.session_state._oauth_check_count < 2:
+        st.session_state._oauth_check_count += 1
+        st.write(f"🔧 DEBUG: Query params empty on attempt {st.session_state._oauth_check_count}/2, triggering rerun...")
+        st.rerun()
+    
+    if not raw_params:
+        st.warning("⚠️ DEBUG: Query params still empty after 2 reruns. Streamlit cannot read the ?code= from URL.")
+        st.write("This is a known Streamlit bug. The code is in your browser URL but Streamlit can't access it.")
+    
+    st.session_state._oauth_check_count = 0  # Reset counter after successful read or giving up
+    
+    # ALWAYS show raw params for debugging
+    st.write("🔧 DEBUG: raw_params =", raw_params)
+    st.write("🔧 DEBUG: 'code' in raw_params?", "code" in raw_params)
     
     if debug_mode and raw_params:
         st.write("🔍 DEBUG: Raw query params:", {k: f"<{type(v).__name__}> len={len(v) if isinstance(v, (list, str)) else '?'}" for k, v in raw_params.items()})
@@ -1730,13 +1849,9 @@ def main():
     
     st.set_page_config(page_title="Gym Monster", layout="wide")
     
-    # Step 1: Extract tokens from URL fragment if present (implicit flow)
-    # This JS component moves #access_token=... to ?access_token=...
-    # Must run before handle_oauth_callback() reads query params
-    extract_fragment_tokens()
-    
-    # Step 2: Handle OAuth callback - processes both PKCE and implicit flows
+    # Step 1 & 2: Handle OAuth callback - processes both PKCE and implicit flows
     # This MUST run on every page load to catch redirects with ?code=... or ?access_token=...
+    # The handler uses JavaScript to read URL params (workaround for Streamlit bug)
     # If code/tokens found: exchanges for session, saves to st.session_state, clears URL, reruns
     # If not found: continues normally to main app
     handle_oauth_callback()
