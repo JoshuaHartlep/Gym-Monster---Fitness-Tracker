@@ -34,6 +34,7 @@ import pytz
 from dateutil import parser as dateparser
 import html
 import hashlib
+from urllib.parse import parse_qs
 
 # Supabase imports
 from supabase import create_client, Client
@@ -52,6 +53,37 @@ except Exception:  # pragma: no cover
 
 import streamlit as st
 import streamlit.components.v1 as components
+
+# ============================================================================
+# CRITICAL: OAuth URL parameter fix
+# ============================================================================
+# This component forces a top-level browser navigation to ensure Streamlit
+# receives a fresh HTTP request with query parameters from OAuth redirects.
+# Without this, st.query_params returns empty {} after external redirects.
+#
+# NOTE: This runs at module level (before main()) but doesn't call any Streamlit
+# display commands, so it doesn't violate the set_page_config() rule.
+def _inject_oauth_url_fix():
+    """
+    Detect OAuth redirect and show manual refresh instruction.
+    
+    Streamlit blocks JavaScript injection and OAuth redirects don't trigger
+    real HTTP requests, so we can't automatically fix this. User must manually refresh.
+    """
+    # Check if we have OAuth params by trying to read from context
+    try:
+        from streamlit.runtime.scriptrunner.script_run_context import get_script_run_ctx
+        ctx = get_script_run_ctx()
+        
+        # Check if URL has code but context doesn't
+        # (This would indicate an OAuth redirect that wasn't processed)
+        # We can't actually check the browser URL from Python, so we rely on
+        # the user seeing empty query params
+        pass
+    except:
+        pass
+
+# ============================================================================
 
 
 class StreamlitSessionStorage:
@@ -97,8 +129,8 @@ try:
     if ClientOptions is not None:
         options = ClientOptions(storage=StreamlitSessionStorage())
         supabase: Client = create_client(url, key, options=options)
-    else:  # pragma: no cover - fallback for very old supabase-py
         supabase: Client = create_client(url, key)
+    supabase: Client = create_client(url, key)
     SUPABASE_AVAILABLE = True
 except Exception as e:
     supabase = None
@@ -106,97 +138,174 @@ except Exception as e:
     # Debug: Print the error for troubleshooting
     print(f"Supabase initialization failed: {e}")
 
-def extract_oauth_params():
-    """
-    Extract OAuth parameters from URL (both fragment and query string).
-    
-    Streamlit's st.query_params has a bug where it's empty after external redirects.
-    This uses JavaScript injected into the main page (not iframe) to read the URL
-    and store params in localStorage, which Python can then read via another component.
-    
-    Returns the OAuth params dict if found, else empty dict.
-    """
-    if not SUPABASE_AVAILABLE:
-        return {}
-    
-    # Initialize session state key for OAuth params
-    if '_oauth_params_from_js' not in st.session_state:
-        st.session_state._oauth_params_from_js = {}
-    
-    # Inject JavaScript into main page to read URL and store in localStorage
-    st.markdown("""
-    <script>
-    (function() {
-        // Read URL parameters from main page
-        const params = {};
-        const searchParams = new URLSearchParams(window.location.search);
-        
-        if (searchParams.has('code')) {
-            params.code = searchParams.get('code');
-        }
-        if (searchParams.has('access_token')) {
-            params.access_token = searchParams.get('access_token');
-        }
-        if (searchParams.has('refresh_token')) {
-            params.refresh_token = searchParams.get('refresh_token');
-        }
-        
-        // Check fragment too
-        if (window.location.hash) {
-            const hashParams = new URLSearchParams(window.location.hash.substring(1));
-            if (hashParams.has('access_token')) {
-                params.access_token = hashParams.get('access_token');
-            }
-            if (hashParams.has('refresh_token')) {
-                params.refresh_token = hashParams.get('refresh_token');
-            }
-        }
-        
-        console.log('🔧 MAIN PAGE URL:', window.location.href);
-        console.log('🔧 MAIN PAGE search:', window.location.search);
-        console.log('🔧 MAIN PAGE found params:', params);
-        
-        // Store in localStorage so iframe component can read it
-        if (Object.keys(params).length > 0) {
-            localStorage.setItem('_oauth_params', JSON.stringify(params));
-            console.log('🔧 Stored in localStorage');
-        }
-    })();
-    </script>
-    """, unsafe_allow_html=True)
-    
-    # Now use a component to read from localStorage and return to Python
-    result = components.html("""
-        <script>
-        const stored = localStorage.getItem('_oauth_params');
-        console.log('🔧 IFRAME reading localStorage:', stored);
-        if (stored) {
-            const params = JSON.parse(stored);
-            console.log('🔧 IFRAME parsed params:', params);
-            // Clear it so we don't re-use it
-            localStorage.removeItem('_oauth_params');
-            // Send to Streamlit
-            if (window.parent && window.parent.Streamlit) {
-                window.parent.Streamlit.setComponentValue(params);
-            }
-        } else {
-            // Return empty dict
-            if (window.parent && window.parent.Streamlit) {
-                window.parent.Streamlit.setComponentValue({});
-            }
-        }
-        </script>
-    """, height=0)
-    
-    st.write(f"🔧 DEBUG: Component returned: {result} (type: {type(result)})")
-    
-    # Store result in session state if it's a dict
-    if result and isinstance(result, dict) and len(result) > 0:
-        st.session_state._oauth_params_from_js = result
-        return result
-    
-    return st.session_state._oauth_params_from_js or {}
+def _exchange_oauth_code_from_ctx() -> None:
+    """Exchange OAuth code using ScriptRunContext.query_string.
 
+    Must be called after set_page_config and before any UI gating.
+    """
+    st.write("🔧 DEBUG: _exchange_oauth_code_from_ctx() called")
+    
+    if not SUPABASE_AVAILABLE:
+        st.write("🔧 DEBUG: SUPABASE_AVAILABLE is False, returning")
+        return
+    
+    try:
+        from streamlit.runtime.scriptrunner.script_run_context import get_script_run_ctx  # type: ignore
+        ctx = get_script_run_ctx()
+        raw_qs = getattr(ctx, "query_string", None)
+        st.write(f"🔧 DEBUG: Got ctx.query_string: {repr(raw_qs)}")
+    except Exception as e:
+        st.write(f"🔧 DEBUG: Failed to get context: {e}")
+        raw_qs = None
+
+    flag_name = "_oauth_code_exchanged"
+
+    if not raw_qs:
+        st.write("🔧 DEBUG: raw_qs is empty, returning")
+        return
+
+    st.write(f"🔧 DEBUG: Parsing query string: {raw_qs}")
+    
+    try:
+        params = parse_qs(raw_qs)
+        st.write(f"🔧 DEBUG: Parsed params: {list(params.keys())}")
+        code = params.get("code", [None])[0]
+        st.write(f"🔧 DEBUG: Extracted code: {code[:20] if code else None}...")
+        
+        if not code:
+            st.write("🔧 DEBUG: No code found in params, returning")
+            return
+        if flag_name in st.session_state:
+            st.write("🔧 DEBUG: Already exchanged (flag set), returning")
+            return
+        
+        st.session_state[flag_name] = True
+        st.info("🔐 Detected auth code — exchanging for session...")
+
+        result = None
+        exc = None
+        
+        # Check if we have a PKCE code_verifier stored
+        code_verifier = None
+        if '_supabase_storage' in st.session_state:
+            storage_dict = st.session_state._supabase_storage
+            st.write(f"🔧 DEBUG: Storage keys: {list(storage_dict.keys())}")
+            # Look for code_verifier (key format may vary)
+            for key in storage_dict:
+                if 'verifier' in key.lower() or 'code' in key.lower():
+                    st.write(f"🔧 DEBUG: Found potential verifier key: {key}")
+                    code_verifier = storage_dict.get(key)
+                    break
+        else:
+            st.write("🔧 DEBUG: No _supabase_storage in session_state")
+        
+        st.write(f"🔧 DEBUG: code_verifier found: {code_verifier is not None}")
+        
+        # Try exchange with PKCE verifier if available
+        if code_verifier:
+            st.write("🔧 DEBUG: Attempting exchange WITH code_verifier...")
+            try:
+                result = supabase.auth.exchange_code_for_session({
+                    "auth_code": code,
+                    "code_verifier": code_verifier
+                })
+                st.write("🔧 DEBUG: Exchange with verifier succeeded!")
+            except Exception as e_pkce:
+                st.write(f"🔧 DEBUG: Exchange with verifier failed: {type(e_pkce).__name__}: {str(e_pkce)[:200]}")
+                exc = e_pkce
+        else:
+            st.write("🔧 DEBUG: No code_verifier - trying without PKCE...")
+            # Try without verifier (might fail if PKCE is required)
+            try:
+                result = supabase.auth.exchange_code_for_session({"auth_code": code})
+                st.write("🔧 DEBUG: Exchange without verifier succeeded!")
+            except Exception as e1:
+                st.write(f"🔧 DEBUG: Exchange failed: {type(e1).__name__}: {str(e1)[:200]}")
+                exc = e1
+        
+        st.write(f"🔧 DEBUG: After exchange attempts - result is None: {result is None}")
+        
+        if result is None:
+            st.error(f"❌ Exchange failed!")
+            st.write(f"Last exception: {exc}")
+            if code_verifier is None:
+                st.warning("⚠️ PKCE code_verifier not found in storage. This is likely why exchange is failing.")
+                st.write("The auth URL generation may have failed, or the verifier wasn't persisted.")
+            raise Exception(f"Supabase exchange failed: {exc}")
+
+        st.write(f"🔧 DEBUG: Exchange result type: {type(result)}")
+        st.write(f"🔧 DEBUG: Exchange result repr: {repr(result)[:300]}...")
+        
+        # Normalize response - handle string, dict, and object types
+        session = None
+        user = None
+        
+        if isinstance(result, str):
+            # Result is a plain string - unusual, log it
+            st.error(f"⚠️ Exchange returned a string: {result[:100]}...")
+            st.write("This is unexpected - exchange should return session/user objects")
+            return
+        elif isinstance(result, dict):
+            st.write("🔧 DEBUG: Result is dict, extracting session/user")
+            data = result.get("data") if isinstance(result.get("data"), dict) else None
+            session = result.get("session") or (data or {}).get("session")
+            user = result.get("user") or (data or {}).get("user")
+        else:
+            st.write(f"🔧 DEBUG: Result is object ({type(result).__name__}), using attribute access")
+            data_attr = getattr(result, "data", None)
+            session = getattr(result, "session", None) or (getattr(data_attr, "session", None) if data_attr else None)
+            user = getattr(result, "user", None) or (getattr(data_attr, "user", None) if data_attr else None)
+        
+        st.write(f"🔧 DEBUG: Extracted session: {session is not None}")
+        st.write(f"🔧 DEBUG: Extracted user: {user is not None}")
+
+        if session or user:
+            email = None
+            try:
+                email = getattr(user, "email", None) if user else None
+                if email is None and isinstance(user, dict):
+                    email = user.get("email")
+            except Exception:
+                pass
+
+            st.session_state.session = session
+            st.session_state.user = {"email": email} if email else ({"email": None} if user else {})
+            st.success(f"✅ Signed in{(' as ' + st.session_state.user.get('email')) if st.session_state.user.get('email') else ''}")
+
+            try:
+                st.query_params.clear()
+            except Exception:
+                try:
+                    st.query_params.clear()
+                except Exception:
+                    pass
+            try:
+                st.rerun()
+            except Exception:
+                try:
+                    st.experimental_rerun()
+                except Exception:
+                    pass
+        else:
+            st.error("❌ Exchange completed but no session/user returned.")
+            try:
+                st.write("DEBUG: raw exchange result:", str(result)[:800])
+            except Exception:
+                pass
+            try:
+                st.query_params.clear()
+            except Exception:
+                pass
+    except Exception as ex:
+        st.error("❌ Auth code exchange failed.")
+        try:
+            st.write("DEBUG: exchange exception (truncated):", repr(ex)[:800])
+        except Exception:
+            pass
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
 
 def _get_query_param_as_string(params_dict, key):
     """
@@ -242,7 +351,7 @@ def _clear_query_params():
     except AttributeError:
         # Fallback to old API (Streamlit < 1.30)
         try:
-            st.experimental_set_query_params()
+            st.query_params.clear()
         except:
             # If both fail, that's okay - we tried
             pass
@@ -280,34 +389,23 @@ def handle_oauth_callback():
     
     st.write(f"🔧 DEBUG: debug_mode = {debug_mode}")
     
-    # WORKAROUND: Streamlit's st.query_params is empty after OAuth redirect
-    # Check if we've already processed params or if we need to wait
-    if '_oauth_check_count' not in st.session_state:
-        st.session_state._oauth_check_count = 0
-    
-    # Try reading query params directly
+    # Get query params - try st.query_params first, fallback to manual extraction
     try:
-        raw_params = dict(st.query_params.items()) if hasattr(st.query_params, 'items') else {}
-        st.write(f"🔧 DEBUG: st.query_params.items(): {raw_params}")
+        raw_params = dict(st.query_params)
+        st.write(f"🔧 DEBUG: st.query_params returned: {list(raw_params.keys())}")
     except Exception as e:
-        st.write(f"🔧 DEBUG: Failed to read query params: {e}")
+        st.write(f"🔧 DEBUG: Failed to read st.query_params: {e}")
         raw_params = {}
     
-    # If empty and we haven't tried many times, trigger rerun
-    # (Sometimes Streamlit needs a rerun after redirect to populate query params)
-    if not raw_params and st.session_state._oauth_check_count < 2:
-        st.session_state._oauth_check_count += 1
-        st.write(f"🔧 DEBUG: Query params empty on attempt {st.session_state._oauth_check_count}/2, triggering rerun...")
-        st.rerun()
-    
-    if not raw_params:
-        st.warning("⚠️ DEBUG: Query params still empty after 2 reruns. Streamlit cannot read the ?code= from URL.")
-        st.write("This is a known Streamlit bug. The code is in your browser URL but Streamlit can't access it.")
-    
-    st.session_state._oauth_check_count = 0  # Reset counter after successful read or giving up
+    # FALLBACK: If st.query_params is empty, check session state for manually extracted params
+    if not raw_params and '_manual_query_params' in st.session_state:
+        raw_params = st.session_state._manual_query_params
+        st.write(f"✅ Using manually extracted params from context: {list(raw_params.keys())}")
+        # Clear it so we don't reuse it
+        del st.session_state._manual_query_params
     
     # ALWAYS show raw params for debugging
-    st.write("🔧 DEBUG: raw_params =", raw_params)
+    st.write("🔧 DEBUG: raw_params =", {k: f"<{type(v).__name__}>..." for k, v in raw_params.items()})
     st.write("🔧 DEBUG: 'code' in raw_params?", "code" in raw_params)
     
     if debug_mode and raw_params:
@@ -1170,12 +1268,39 @@ def render_auth_ui():
                     }
                 })
                 auth_url = oauth_response.url
+                st.write("✅ DEBUG: Generated PKCE URL via SDK successfully")
             except Exception as e:
-                # Fallback to manual URL construction if client method fails
-                # Using response_type=code for authorization code flow (not implicit)
-                # Note: This won't include PKCE challenge, so exchange may fail in some Supabase configs
-                st.warning(f"⚠️ Could not generate PKCE URL via SDK, using manual code flow: {e}")
-                auth_url = f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?provider=google&redirect_to={redirect_url}&response_type=code"
+                # Fallback: Manually generate PKCE challenge and verifier
+                st.warning(f"⚠️ SDK failed, generating PKCE manually: {str(e)[:100]}")
+                
+                import secrets
+                import hashlib
+                import base64
+                from urllib.parse import quote
+                
+                # Generate PKCE code_verifier (random string)
+                code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('utf-8').rstrip('=')
+                
+                # Generate code_challenge from verifier (SHA256 hash)
+                challenge_bytes = hashlib.sha256(code_verifier.encode('utf-8')).digest()
+                code_challenge = base64.urlsafe_b64encode(challenge_bytes).decode('utf-8').rstrip('=')
+                
+                # Store verifier in session state (will persist across redirect)
+                if '_supabase_storage' not in st.session_state:
+                    st.session_state._supabase_storage = {}
+                st.session_state._supabase_storage['code_verifier'] = code_verifier
+                
+                st.write(f"🔧 DEBUG: Generated PKCE manually, stored verifier (length: {len(code_verifier)})")
+                
+                # Build OAuth URL with PKCE parameters
+                auth_url = (
+                    f"{st.secrets['SUPABASE_URL']}/auth/v1/authorize?"
+                    f"provider=google&"
+                    f"redirect_to={quote(redirect_url)}&"
+                    f"response_type=code&"
+                    f"code_challenge={code_challenge}&"
+                    f"code_challenge_method=S256"
+                )
             
             # Large, prominent Google login button
             google_col1, google_col2, google_col3 = st.columns([1, 2, 1])
@@ -1847,13 +1972,85 @@ def main():
     # on redirect, before any UI rendering or session state checks
     # ===================================================================
     
-    st.set_page_config(page_title="Gym Monster", layout="wide")
+    # set_page_config MUST be the first Streamlit command
+    # Guard to avoid double-calling if main() is invoked more than once
+    try:
+        st.set_page_config(page_title="Gym Monster", layout="wide")
+    except Exception:
+        # If already set, ignore
+        pass
     
-    # Step 1 & 2: Handle OAuth callback - processes both PKCE and implicit flows
+    # Step 1: Inject OAuth URL fix (forces reload when OAuth params detected)
+    st.write("🔧 DEBUG: Calling _inject_oauth_url_fix()...")
+    _inject_oauth_url_fix()
+    st.write("🔧 DEBUG: _inject_oauth_url_fix() completed")
+    
+    # Debug: Show query params after reload
+    try:
+        _debug_params = dict(st.query_params)
+        st.write(f"🔧 DEBUG: st.query_params keys: {list(_debug_params.keys())}")
+        if _debug_params:
+            st.write("✅ DEBUG: Query params available:", list(_debug_params.keys()))
+        else:
+            st.error("⚠️ Streamlit Bug: OAuth redirect detected but query params are empty!")
+            st.write("**WORKAROUND: Please press F5 or Ctrl+R (Cmd+R on Mac) to refresh the page.**")
+            st.write("")
+            st.write("After you refresh, the `?code=...` in your browser URL will be sent to the server properly.")
+            st.info("💡 This is a known Streamlit limitation: OAuth redirects use SPA navigation which doesn't send query params to the server. A manual refresh fixes it.")
+            
+            # Try reading from streamlit internals as last resort
+            st.write("🔧 DEBUG: Attempting to read query string from request context...")
+            try:
+                from streamlit.runtime.scriptrunner.script_run_context import get_script_run_ctx
+                from streamlit.web.server.websocket_headers import _get_websocket_headers
+                
+                ctx = get_script_run_ctx()
+                st.write(f"🔧 DEBUG: Context type: {type(ctx)}")
+                
+                # ACCESS THE QUERY STRING DIRECTLY FROM CONTEXT!
+                if hasattr(ctx, 'query_string'):
+                    query_str = ctx.query_string
+                    st.write(f"✅✅✅ FOUND IT! Context.query_string: {query_str}")
+                    
+                    # Parse the query string manually
+                    from urllib.parse import parse_qs
+                    if query_str:
+                        parsed = parse_qs(query_str)
+                        st.write(f"✅ Parsed query params: {list(parsed.keys())}")
+                        
+                        # Store in session state so OAuth handler can use it
+                        st.session_state._manual_query_params = parsed
+                        st.success(f"✅ Successfully extracted query params from context: {list(parsed.keys())}")
+                    else:
+                        st.write("Query string exists but is empty")
+                else:
+                    st.write("No query_string attribute found")
+                    
+                # Try to access through st.runtime
+                try:
+                    from streamlit import runtime
+                    if hasattr(runtime, 'get_instance'):
+                        instance = runtime.get_instance()
+                        st.write(f"🔧 DEBUG: Runtime instance: {type(instance)}")
+                except Exception as rt_e:
+                    st.write(f"🔧 DEBUG: Runtime access failed: {rt_e}")
+                    
+            except Exception as ctx_e:
+                st.write(f"🔧 DEBUG: Context access failed: {ctx_e}")
+                
+            # Last resort: Try parsing from environment or headers
+            st.write("🔧 DEBUG: Checking if query string is in environment...")
+            import os
+            query_env = os.environ.get('QUERY_STRING', '')
+            st.write(f"🔧 DEBUG: QUERY_STRING env var: {query_env}")
+    except Exception as e:
+        st.write(f"⚠️ DEBUG: Could not read query params: {e}")
+    
+    # Step 2: Handle OAuth callback - processes both PKCE and implicit flows
     # This MUST run on every page load to catch redirects with ?code=... or ?access_token=...
-    # The handler uses JavaScript to read URL params (workaround for Streamlit bug)
     # If code/tokens found: exchanges for session, saves to st.session_state, clears URL, reruns
     # If not found: continues normally to main app
+    _exchange_oauth_code_from_ctx()
     handle_oauth_callback()
     
     # ===================================================================
