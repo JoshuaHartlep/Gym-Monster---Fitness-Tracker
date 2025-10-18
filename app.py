@@ -2136,6 +2136,8 @@ def main():
         len(code_verifier_param) if code_verifier_param else 0,
     )
 
+    st.warning("GOOGLE OAUTH UNDER CONSTRUCTION — PLEASE USE MANUAL SIGN-IN")
+
     _bootstrap_pkce_verifier_from_local_storage(params)
     
     # Step 2: Handle OAuth callback - processes both PKCE and implicit flows
